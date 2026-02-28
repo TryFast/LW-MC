@@ -1,5 +1,5 @@
 /*
- * Compile: g++ -std=c++17 -O2 -o launcher.exe launcher.cpp -lwinhttp -lole32 -lshell32
+ * Compile: g++ -std=c++17 -O2 -o launcher.exe launcher.cpp -lwinhttp -lshell32
  */
 
 #define UNICODE
@@ -8,42 +8,39 @@
 
 #include <windows.h>
 #include <winhttp.h>
-#include <shlobj.h>
-#include <objbase.h>
-#include <iostream>
+#include <filesystem>
 #include <fstream>
-#include <sstream>
 #include <string>
 #include <vector>
-#include <map>
-#include <functional>
+#include <unordered_map>
 #include <algorithm>
-#include <filesystem>
-#include <stdexcept>
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <iostream>
 
 #pragma comment(lib, "winhttp.lib")
-#pragma comment(lib, "ole32.lib")
-#pragma comment(lib, "shell32.lib")
 
 namespace fs = std::filesystem;
 
+// ── JSON ──────────────────────────────────────────────────────────────────────
+
 struct JVal {
-    enum { Null, Bool, Num, Str, Arr, Obj } type = Null;
+    enum Type : uint8_t { Null, Bool, Num, Str, Arr, Obj } type = Null;
     bool        bval = false;
-    double      nval = 0;
+    double      nval = 0.0;
     std::string sval;
     std::vector<JVal>                         arr;
     std::vector<std::pair<std::string, JVal>> obj;
 
-    bool is_null()   const { return type == Null; }
-    bool is_string() const { return type == Str;  }
-    bool is_array()  const { return type == Arr;  }
-    bool is_object() const { return type == Obj;  }
-    bool is_bool()   const { return type == Bool; }
+    inline bool is_null()   const { return type == Null; }
+    inline bool is_string() const { return type == Str;  }
+    inline bool is_array()  const { return type == Arr;  }
+    inline bool is_object() const { return type == Obj;  }
 
     const JVal& operator[](const std::string& k) const {
         for (auto& p : obj) if (p.first == k) return p.second;
-        static JVal null; return null;
+        static JVal nv; return nv;
     }
     JVal& operator[](const std::string& k) {
         for (auto& p : obj) if (p.first == k) return p.second;
@@ -51,22 +48,26 @@ struct JVal {
         return obj.back().second;
     }
     const JVal& operator[](size_t i) const { return arr[i]; }
+
     bool has(const std::string& k) const {
         for (auto& p : obj) if (p.first == k) return true;
         return false;
     }
-    std::string str()  const { return sval; }
-    double      num()  const { return nval; }
-    size_t      size() const { return type == Arr ? arr.size() : obj.size(); }
+    const std::string& str()  const { return sval; }
+    double             num()  const { return nval; }
+    size_t             size() const { return type == Arr ? arr.size() : obj.size(); }
 };
 
-static void skip_ws(const char*& p) {
-    while (*p && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) ++p;
+namespace {
+
+inline void skip_ws(const char*& p) {
+    while ((*p == ' ') | (*p == '\t') | (*p == '\r') | (*p == '\n')) ++p;
 }
 
-static std::string parse_string(const char*& p) {
+std::string parse_str_tok(const char*& p) {
     ++p;
     std::string s;
+    s.reserve(64);
     while (*p && *p != '"') {
         if (*p == '\\') {
             ++p;
@@ -88,163 +89,215 @@ static std::string parse_string(const char*& p) {
     return s;
 }
 
-static JVal parse_value(const char*& p);
+JVal parse_val(const char*& p);
 
-static JVal parse_object(const char*& p) {
+JVal parse_obj(const char*& p) {
     JVal v; v.type = JVal::Obj;
     ++p;
-    skip_ws(p);
-    while (*p && *p != '}') {
+    for (;;) {
         skip_ws(p);
+        if (!*p || *p == '}') break;
         if (*p != '"') break;
-        std::string key = parse_string(p);
+        std::string key = parse_str_tok(p);
         skip_ws(p);
         if (*p == ':') ++p;
-        skip_ws(p);
-        JVal val = parse_value(p);
-        v.obj.push_back({key, std::move(val)});
+        v.obj.push_back({std::move(key), parse_val(p)});
         skip_ws(p);
         if (*p == ',') ++p;
-        skip_ws(p);
     }
     if (*p == '}') ++p;
     return v;
 }
 
-static JVal parse_array(const char*& p) {
+JVal parse_arr(const char*& p) {
     JVal v; v.type = JVal::Arr;
     ++p;
-    skip_ws(p);
-    while (*p && *p != ']') {
-        v.arr.push_back(parse_value(p));
+    for (;;) {
+        skip_ws(p);
+        if (!*p || *p == ']') break;
+        v.arr.push_back(parse_val(p));
         skip_ws(p);
         if (*p == ',') ++p;
-        skip_ws(p);
     }
     if (*p == ']') ++p;
     return v;
 }
 
-static JVal parse_value(const char*& p) {
+JVal parse_val(const char*& p) {
     skip_ws(p);
-    if (!*p) return JVal{};
-    if (*p == '{') return parse_object(p);
-    if (*p == '[') return parse_array(p);
-    if (*p == '"') {
-        JVal v; v.type = JVal::Str; v.sval = parse_string(p); return v;
+    switch (*p) {
+        case '{': return parse_obj(p);
+        case '[': return parse_arr(p);
+        case '"': { JVal v; v.type = JVal::Str; v.sval = parse_str_tok(p); return v; }
+        case 't': if (!strncmp(p,"true", 4)) { JVal v; v.type=JVal::Bool; v.bval=true;  p+=4; return v; } break;
+        case 'f': if (!strncmp(p,"false",5)) { JVal v; v.type=JVal::Bool; v.bval=false; p+=5; return v; } break;
+        case 'n': if (!strncmp(p,"null", 4)) { p+=4; return JVal{}; } break;
     }
-    if (strncmp(p, "true",  4) == 0) { JVal v; v.type = JVal::Bool; v.bval = true;  p += 4; return v; }
-    if (strncmp(p, "false", 5) == 0) { JVal v; v.type = JVal::Bool; v.bval = false; p += 5; return v; }
-    if (strncmp(p, "null",  4) == 0) { p += 4; return JVal{}; }
     char* end;
-    double d = strtod(p, &end);
-    JVal v; v.type = JVal::Num; v.nval = d; p = end; return v;
+    JVal v; v.type = JVal::Num; v.nval = strtod(p, &end); p = end;
+    return v;
 }
 
-static JVal parse_json(const std::string& src) {
+JVal parse_json(const std::string& src) {
     const char* p = src.c_str();
-    return parse_value(p);
+    return parse_val(p);
 }
 
-struct ParsedUrl {
-    std::wstring scheme, host, path;
-    INTERNET_PORT port = INTERNET_DEFAULT_HTTPS_PORT;
-    bool is_https = true;
-};
+// ── WinHTTP ───────────────────────────────────────────────────────────────────
 
-static std::wstring s2w(const std::string& s) {
-    if (s.empty()) return {};
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
-    std::wstring w(n, 0);
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), n);
-    if (!w.empty() && w.back() == 0) w.pop_back();
+inline std::wstring to_wide(const char* s, int len = -1) {
+    if (!s || !*s) return {};
+    int n = MultiByteToWideChar(CP_UTF8, 0, s, len, nullptr, 0);
+    std::wstring w(n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s, len, w.data(), n);
     return w;
 }
+inline std::wstring to_wide(const std::string& s) { return to_wide(s.c_str(), (int)s.size()); }
 
-static std::string w2s(const std::wstring& w) {
-    if (w.empty()) return {};
-    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
-    std::string s(n, 0);
-    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, s.data(), n, nullptr, nullptr);
-    if (!s.empty() && s.back() == 0) s.pop_back();
+inline std::string to_utf8(const wchar_t* w, int len = -1) {
+    if (!w || !*w) return {};
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, len, nullptr, 0, nullptr, nullptr);
+    std::string s(n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w, len, s.data(), n, nullptr, nullptr);
     return s;
 }
 
-static ParsedUrl crack_url(const std::wstring& url) {
-    ParsedUrl r;
+struct WSession {
+    HINTERNET h = nullptr;
+    WSession() {
+        h = WinHttpOpen(L"MCLauncher/2.0",
+            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+            WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (h) {
+            DWORD pol = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+            WinHttpSetOption(h, WINHTTP_OPTION_REDIRECT_POLICY, &pol, sizeof(pol));
+        }
+    }
+    ~WSession() { if (h) WinHttpCloseHandle(h); }
+    WSession(const WSession&) = delete;
+    WSession& operator=(const WSession&) = delete;
+} g_sess;
+
+struct CrackResult { std::wstring host, path; INTERNET_PORT port; bool https; };
+
+CrackResult crack_url(const std::wstring& url) {
+    CrackResult r{};
     URL_COMPONENTS uc{};
     uc.dwStructSize = sizeof(uc);
-    wchar_t host[512]{}, path[2048]{}, scheme[16]{};
+    wchar_t host[512]{}, path[4096]{};
     uc.lpszHostName = host; uc.dwHostNameLength = 512;
-    uc.lpszUrlPath  = path; uc.dwUrlPathLength  = 2048;
-    uc.lpszScheme   = scheme; uc.dwSchemeLength  = 16;
+    uc.lpszUrlPath  = path; uc.dwUrlPathLength  = 4096;
     WinHttpCrackUrl(url.c_str(), 0, 0, &uc);
-    r.host     = host;
-    r.path     = path;
-    r.scheme   = scheme;
-    r.port     = uc.nPort;
-    r.is_https = (uc.nScheme == INTERNET_SCHEME_HTTPS);
+    r.host  = host;
+    r.path  = path;
+    r.port  = uc.nPort;
+    r.https = (uc.nScheme == INTERNET_SCHEME_HTTPS);
     return r;
 }
 
-static std::string http_get(const std::string& url_s) {
-    std::wstring url = s2w(url_s);
-    auto pu = crack_url(url);
+// Opens a GET request following up to max_redir redirects.
+// Caller must close out_conn and returned handle on success.
+HINTERNET open_req(const std::string& url_s, HINTERNET& out_conn, int max_redir = 10) {
+    if (!g_sess.h) return nullptr;
+    std::string cur = url_s;
 
-    HINTERNET hSess = WinHttpOpen(L"MCLauncher/2.0",
-        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!hSess) return {};
+    for (int i = 0; i <= max_redir; ++i) {
+        auto pu = crack_url(to_wide(cur));
 
-    HINTERNET hConn = WinHttpConnect(hSess, pu.host.c_str(), pu.port, 0);
-    if (!hConn) { WinHttpCloseHandle(hSess); return {}; }
+        HINTERNET hConn = WinHttpConnect(g_sess.h, pu.host.c_str(), pu.port, 0);
+        if (!hConn) return nullptr;
 
-    DWORD flags = pu.is_https ? WINHTTP_FLAG_SECURE : 0;
-    HINTERNET hReq = WinHttpOpenRequest(hConn, L"GET", pu.path.c_str(),
-        nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
-    if (!hReq) { WinHttpCloseHandle(hConn); WinHttpCloseHandle(hSess); return {}; }
+        DWORD flags = pu.https ? WINHTTP_FLAG_SECURE : 0;
+        HINTERNET hReq = WinHttpOpenRequest(hConn, L"GET", pu.path.c_str(),
+            nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+        if (!hReq) { WinHttpCloseHandle(hConn); return nullptr; }
 
-    DWORD sec = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
-                SECURITY_FLAG_IGNORE_CERT_CN_INVALID;
-    WinHttpSetOption(hReq, WINHTTP_OPTION_SECURITY_FLAGS, &sec, sizeof(sec));
+        if (pu.https) {
+            DWORD sec = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
+                        SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
+                        SECURITY_FLAG_IGNORE_CERT_CN_INVALID;
+            WinHttpSetOption(hReq, WINHTTP_OPTION_SECURITY_FLAGS, &sec, sizeof(sec));
+        }
 
-    bool sent = WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                                   WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
-                WinHttpReceiveResponse(hReq, nullptr);
+        if (!WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+            !WinHttpReceiveResponse(hReq, nullptr)) {
+            WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConn);
+            return nullptr;
+        }
+
+        DWORD status = 0, sz = sizeof(status);
+        WinHttpQueryHeaders(hReq,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz, WINHTTP_NO_HEADER_INDEX);
+
+        if (status == 301 || status == 302 || status == 303 ||
+            status == 307 || status == 308) {
+            DWORD loc_sz = 0;
+            WinHttpQueryHeaders(hReq, WINHTTP_QUERY_LOCATION,
+                WINHTTP_HEADER_NAME_BY_INDEX, nullptr, &loc_sz, WINHTTP_NO_HEADER_INDEX);
+            if (loc_sz > 0) {
+                std::wstring loc(loc_sz / sizeof(wchar_t) + 1, L'\0');
+                WinHttpQueryHeaders(hReq, WINHTTP_QUERY_LOCATION,
+                    WINHTTP_HEADER_NAME_BY_INDEX, loc.data(), &loc_sz, WINHTTP_NO_HEADER_INDEX);
+                while (!loc.empty() && loc.back() == L'\0') loc.pop_back();
+                cur = to_utf8(loc.c_str());
+            }
+            WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConn);
+            continue;
+        }
+
+        out_conn = hConn;
+        return hReq;
+    }
+    return nullptr;
+}
+
+std::string http_get_str(const std::string& url) {
+    HINTERNET hConn = nullptr;
+    HINTERNET hReq  = open_req(url, hConn);
+    if (!hReq) return {};
 
     std::string result;
-    if (sent) {
-        DWORD avail = 0;
-        while (WinHttpQueryDataAvailable(hReq, &avail) && avail > 0) {
-            std::string buf(avail, 0);
-            DWORD read = 0;
-            WinHttpReadData(hReq, buf.data(), avail, &read);
-            result.append(buf.data(), read);
-        }
-    }
+    result.reserve(65536);
+    char buf[8192];
+    DWORD read = 0;
+    while (WinHttpReadData(hReq, buf, sizeof(buf), &read) && read) result.append(buf, read);
 
-    WinHttpCloseHandle(hReq);
-    WinHttpCloseHandle(hConn);
-    WinHttpCloseHandle(hSess);
+    WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConn);
     return result;
 }
 
-static bool download_file(const std::string& url, const fs::path& dest) {
-    if (fs::exists(dest) && fs::file_size(dest) > 0) return true;
-    auto data = http_get(url);
-    if (data.empty()) {
-        std::cerr << "  [FAIL] " << dest.filename().string() << "\n";
+// Streams response directly to file — no full-body allocation.
+// Critical for large downloads (JDK zips, client JARs).
+bool http_download(const std::string& url, const fs::path& dest) {
+    HINTERNET hConn = nullptr;
+    HINTERNET hReq  = open_req(url, hConn);
+    if (!hReq) return false;
+
+    fs::create_directories(dest.parent_path());
+
+    HANDLE hFile = CreateFileW(dest.c_str(), GENERIC_WRITE, 0, nullptr,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConn);
         return false;
     }
-    fs::create_directories(dest.parent_path());
-    std::ofstream f(dest, std::ios::binary);
-    f.write(data.data(), data.size());
-    return f.good();
+
+    bool ok = true;
+    char buf[65536];
+    DWORD read = 0, written = 0;
+    while (WinHttpReadData(hReq, buf, sizeof(buf), &read) && read) {
+        if (!WriteFile(hFile, buf, read, &written, nullptr) || written != read) { ok = false; break; }
+    }
+
+    CloseHandle(hFile);
+    WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConn);
+    if (!ok) fs::remove(dest);
+    return ok;
 }
 
-static const std::string MANIFEST_URL  = "https://launchermeta.mojang.com/mc/game/version_manifest.json";
-static const std::string RESOURCES_URL = "https://resources.download.minecraft.net/";
-static const std::string MAIN_CLASS    = "net.minecraft.client.main.Main";
+// ── Config ────────────────────────────────────────────────────────────────────
 
 struct Config {
     std::string username  = "Player";
@@ -252,25 +305,18 @@ struct Config {
     int         ram_gb    = 2;
 };
 
-static std::string escape_json(const std::string& s) {
+inline std::string esc_json(const std::string& s) {
     std::string r;
+    r.reserve(s.size() + 4);
     for (char c : s) {
-        if (c == '"')  { r += "\\\""; }
-        else if (c == '\\') { r += "\\\\"; }
+        if      (c == '"')  r += "\\\"";
+        else if (c == '\\') r += "\\\\";
         else r += c;
     }
     return r;
 }
 
-static std::string config_to_json(const Config& c) {
-    return "{\n"
-           "  \"username\": \""  + escape_json(c.username)  + "\",\n"
-           "  \"java_path\": \"" + escape_json(c.java_path) + "\",\n"
-           "  \"ram_gb\": "      + std::to_string(c.ram_gb) + "\n"
-           "}\n";
-}
-
-static Config load_config(const fs::path& p) {
+Config load_config(const fs::path& p) {
     Config c;
     if (!fs::exists(p)) return c;
     std::ifstream f(p);
@@ -283,22 +329,59 @@ static Config load_config(const fs::path& p) {
     return c;
 }
 
-static void save_config(const Config& c, const fs::path& p) {
-    std::ofstream f(p);
-    f << config_to_json(c);
+void save_config(const Config& c, const fs::path& p) {
+    char buf[512];
+    int n = snprintf(buf, sizeof(buf),
+        "{\n  \"username\": \"%s\",\n  \"java_path\": \"%s\",\n  \"ram_gb\": %d\n}\n",
+        esc_json(c.username).c_str(), esc_json(c.java_path).c_str(), c.ram_gb);
+    if (n > 0) { std::ofstream f(p); f.write(buf, n); }
 }
 
-static bool check_java(const std::string& java) {
-    std::string cmd = "\"" + java + "\" -version > NUL 2>&1";
-    return system(cmd.c_str()) == 0;
+inline bool check_java(const std::string& java) {
+    return system(("\"" + java + "\" -version > NUL 2>&1").c_str()) == 0;
 }
 
-static std::string make_offline_uuid(const std::string& name) {
+// ── Version helpers ───────────────────────────────────────────────────────────
+
+struct MCVer { int v[3] = {}; };
+
+MCVer parse_mc_ver(const std::string& s) {
+    MCVer r{};
+    int idx = 0;
+    const char* p = s.c_str();
+    while (*p && idx < 3) {
+        if (!isdigit((uint8_t)*p)) { if (*p != '.') break; ++p; continue; }
+        while (isdigit((uint8_t)*p)) r.v[idx] = r.v[idx] * 10 + (*p++ - '0');
+        if (++idx < 3 && *p == '.') ++p;
+    }
+    return r;
+}
+
+inline int cmp_ver(const MCVer& a, const MCVer& b) {
+    for (int i = 0; i < 3; ++i) {
+        if (a.v[i] < b.v[i]) return -1;
+        if (a.v[i] > b.v[i]) return  1;
+    }
+    return 0;
+}
+
+inline int required_jdk(const std::string& mc) {
+    static const MCVer v117 = parse_mc_ver("1.17");
+    static const MCVer v121 = parse_mc_ver("1.21");
+    MCVer v = parse_mc_ver(mc);
+    if (cmp_ver(v, v117) < 0) return 8;
+    if (cmp_ver(v, v121) < 0) return 17;
+    return 21;
+}
+
+// ── Minecraft helpers ─────────────────────────────────────────────────────────
+
+std::string make_offline_uuid(const std::string& name) {
     std::string seed = "OfflinePlayer:" + name;
-    unsigned char h[16]{};
-    for (size_t i = 0; i < seed.size(); i++) {
-        h[i % 16]      ^= (unsigned char)(seed[i] * (i + 1));
-        h[(i + 3) % 16] += (unsigned char)seed[i];
+    uint8_t h[16]{};
+    for (size_t i = 0; i < seed.size(); ++i) {
+        h[i % 16]     ^= (uint8_t)(seed[i] * (i + 1));
+        h[(i+3) % 16] += (uint8_t)seed[i];
     }
     h[6] = (h[6] & 0x0f) | 0x30;
     h[8] = (h[8] & 0x3f) | 0x80;
@@ -310,282 +393,400 @@ static std::string make_offline_uuid(const std::string& name) {
     return buf;
 }
 
-static bool lib_applies(const JVal& lib) {
+inline bool lib_applies(const JVal& lib) {
     if (!lib.has("rules")) return true;
     bool allowed = false;
-    for (size_t i = 0; i < lib["rules"].size(); i++) {
-        auto& rule = lib["rules"].arr[i];
-        std::string action = rule["action"].str();
-        bool matches = true;
-        if (rule.has("os")) {
-            std::string os = rule["os"]["name"].str();
-            matches = (os == "windows");
-        }
-        if (matches) allowed = (action == "allow");
+    for (size_t i = 0; i < lib["rules"].size(); ++i) {
+        const auto& rule = lib["rules"].arr[i];
+        bool match = !rule.has("os") || rule["os"]["name"].str() == "windows";
+        if (match) allowed = (rule["action"].str() == "allow");
     }
     return allowed;
 }
 
-static std::string find_java_in_dir(const fs::path& dir) {
-    if (!fs::exists(dir)) return "";
+std::string find_java_in_dir(const fs::path& dir) {
+    if (!fs::exists(dir)) return {};
     std::error_code ec;
-    for (auto& entry : fs::recursive_directory_iterator(dir, ec)) {
-        if (entry.is_regular_file(ec)) {
-            std::string fname = entry.path().filename().string();
-            std::transform(fname.begin(), fname.end(), fname.begin(), ::tolower);
-            if (fname == "java.exe") {
-                return entry.path().string();
-            }
-        }
+    for (auto& e : fs::recursive_directory_iterator(dir, ec)) {
+        if (!e.is_regular_file(ec)) continue;
+        auto fn = e.path().filename().string();
+        std::transform(fn.begin(), fn.end(), fn.begin(), ::tolower);
+        if (fn == "javaw.exe") return e.path().string();
     }
-    return "";
+    return {};
 }
 
-static bool install_bundled_jre(const fs::path& root, Config& cfg, const fs::path& cfg_path) {
-    fs::path jre_dir = root / "jre";
-    std::string existing = find_java_in_dir(jre_dir);
+bool download_file(const std::string& url, const fs::path& dest) {
+    if (fs::exists(dest) && fs::file_size(dest) > 0) return true;
+    if (!http_download(url, dest)) {
+        fprintf(stderr, "  [FAIL] %s\n", dest.filename().string().c_str());
+        return false;
+    }
+    return true;
+}
+
+static const char* MANIFEST_URL  = "https://launchermeta.mojang.com/mc/game/version_manifest.json";
+static const char* RESOURCES_URL = "https://resources.download.minecraft.net/";
+
+// ── JDK install ───────────────────────────────────────────────────────────────
+
+std::string get_adoptium_url(int jdk) {
+    std::string api = "https://api.adoptium.net/v3/assets/latest/" +
+                      std::to_string(jdk) +
+                      "/hotspot?architecture=x64&image_type=jdk&os=windows";
+    printf("  Querying Adoptium API for JDK %d...\n", jdk);
+    std::string resp = http_get_str(api);
+    if (resp.empty()) { fputs("  Adoptium API unreachable.\n", stderr); return {}; }
+    auto j = parse_json(resp);
+    if (!j.is_array() || !j.size()) { fputs("  No packages in response.\n", stderr); return {}; }
+    for (size_t i = 0; i < j.size(); ++i) {
+        const auto& pkg  = j[i]["binary"]["package"];
+        const auto& name = pkg["name"].str();
+        if (name.size() >= 4 && name.compare(name.size()-4, 4, ".zip") == 0) {
+            const auto& url = pkg["link"].str();
+            if (!url.empty()) return url;
+        }
+    }
+    fputs("  No .zip in Adoptium response.\n", stderr);
+    return {};
+}
+
+bool install_bundled_jre(const fs::path& root, Config& cfg, const fs::path& cfg_path,
+                         const std::string& mc_ver = "") {
+    int jdk = mc_ver.empty() ? 8 : required_jdk(mc_ver);
+    fs::path jdk_dir = root / ("jdk" + std::to_string(jdk));
+
+    std::string existing = find_java_in_dir(jdk_dir);
     if (!existing.empty()) {
+        printf("  Found Temurin JDK %d: %s\n", jdk, existing.c_str());
         cfg.java_path = existing;
         save_config(cfg, cfg_path);
         return true;
     }
 
-    std::cout << "\nThis version requires Java 8.\n";
-    std::cout << "No bundled JRE found in: " << jre_dir.string() << "\n";
-    std::cout << "Install Azul Zulu JDK 8 automatically via winget? (y/n): ";
+    printf("\nRequires Java %d. No bundled JDK in: %s\n", jdk, jdk_dir.string().c_str());
+    printf("Download Eclipse Adoptium Temurin JDK %d automatically? (y/n): ", jdk);
     std::string ans;
     std::getline(std::cin, ans);
-    if (ans.empty() || (ans[0] != 'y' && ans[0] != 'Y')) {
-        std::cout << "Skipped JRE installation. Make sure Java 8 is available.\n";
-        return false;
-    }
+    if (ans.empty() || (ans[0] != 'y' && ans[0] != 'Y')) return false;
 
-    fs::create_directories(jre_dir);
-    std::string loc = jre_dir.string();
-    std::string cmd = "winget install Azul.Zulu.8.JDK"
-                      " --location \"" + loc + "\""
-                      " --source winget"
-                      " --accept-source-agreements"
-                      " --accept-package-agreements";
-    std::cout << "\nRunning: " << cmd << "\n\n";
+    std::string dl_url = get_adoptium_url(jdk);
+    if (dl_url.empty()) return false;
+
+    std::string zip_name = dl_url.substr(dl_url.rfind('/') + 1);
+    if (zip_name.empty()) zip_name = "temurin-jdk" + std::to_string(jdk) + ".zip";
+    fs::path zip_dest = root / zip_name;
+
+    printf("  Downloading: %s\n", dl_url.c_str());
+    if (!download_file(dl_url, zip_dest)) { fputs("  Download failed.\n", stderr); return false; }
+
+    printf("  Extracting to: %s\n", jdk_dir.string().c_str());
+    fs::create_directories(jdk_dir);
+
+    std::string cmd = "powershell -NoProfile -Command \"Expand-Archive -Force -LiteralPath '"
+                    + zip_dest.string() + "' -DestinationPath '" + jdk_dir.string() + "'\"";
     int ret = system(cmd.c_str());
-    if (ret != 0) {
-        std::cerr << "winget returned error code " << ret << ".\n";
-        std::cerr << "Try running as Administrator or install Java 8 manually.\n";
-        return false;
-    }
+    if (ret != 0) { fprintf(stderr, "  Extraction failed (exit %d).\n", ret); return false; }
 
-    std::string found = find_java_in_dir(jre_dir);
-    if (found.empty()) {
-        std::cerr << "java.exe not found in jre folder after install.\n";
-        return false;
-    }
+    std::error_code ec;
+    fs::remove(zip_dest, ec);
 
-    std::cout << "JRE installed: " << found << "\n";
+    std::string found = find_java_in_dir(jdk_dir);
+    if (found.empty()) { fprintf(stderr, "javaw.exe not found in jdk%d after extraction.\n", jdk); return false; }
+
+    printf("Temurin JDK %d installed: %s\n", jdk, found.c_str());
     cfg.java_path = found;
     save_config(cfg, cfg_path);
     return true;
 }
 
-static JVal fetch_manifest() {
-    std::cout << "Fetching version manifest...\n";
-    auto s = http_get(MANIFEST_URL);
-    if (s.empty()) { std::cerr << "Failed to fetch manifest.\n"; return JVal{}; }
+// ── Download ──────────────────────────────────────────────────────────────────
+
+JVal fetch_manifest() {
+    fputs("Fetching version manifest...\n", stdout);
+    std::string s = http_get_str(MANIFEST_URL);
+    if (s.empty()) { fputs("Failed to fetch manifest.\n", stderr); return {}; }
     return parse_json(s);
 }
 
-static bool download_minecraft(const fs::path& root, const std::string& version) {
+bool download_minecraft(const fs::path& root, const std::string& version) {
     auto manifest = fetch_manifest();
     if (manifest.is_null()) return false;
 
     std::string ver_url;
-    for (size_t i = 0; i < manifest["versions"].size(); i++) {
-        auto& v = manifest["versions"].arr[i];
+    for (size_t i = 0; i < manifest["versions"].size(); ++i) {
+        const auto& v = manifest["versions"].arr[i];
         if (v["id"].str() == version) { ver_url = v["url"].str(); break; }
     }
-    if (ver_url.empty()) {
-        std::cerr << "Version " << version << " not found in manifest.\n";
-        return false;
-    }
+    if (ver_url.empty()) { fprintf(stderr, "Version %s not found.\n", version.c_str()); return false; }
 
     fs::path ver_dir  = root / "versions" / version;
     fs::path ver_json = ver_dir / (version + ".json");
     fs::path ver_jar  = ver_dir / (version + ".jar");
     fs::create_directories(ver_dir);
 
-    std::cout << "[2/5] Fetching " << version << " version JSON...\n";
+    printf("[2/5] Fetching %s version JSON...\n", version.c_str());
     std::string ver_str;
     if (fs::exists(ver_json)) {
         std::ifstream f(ver_json);
-        ver_str = {std::istreambuf_iterator<char>(f), {}};
+        ver_str.assign(std::istreambuf_iterator<char>(f), {});
     } else {
-        ver_str = http_get(ver_url);
-        if (ver_str.empty()) { std::cerr << "Failed to fetch version JSON.\n"; return false; }
+        ver_str = http_get_str(ver_url);
+        if (ver_str.empty()) { fputs("Failed to fetch version JSON.\n", stderr); return false; }
         std::ofstream f(ver_json); f << ver_str;
     }
     auto vj = parse_json(ver_str);
 
-    std::cout << "[3/5] Downloading client JAR...\n";
-    std::string jar_url = vj["downloads"]["client"]["url"].str();
-    if (!download_file(jar_url, ver_jar)) {
-        std::cerr << "Failed to download client JAR.\n"; return false;
+    fputs("[3/5] Downloading client JAR...\n", stdout);
+    if (!download_file(vj["downloads"]["client"]["url"].str(), ver_jar)) {
+        fputs("Failed to download client JAR.\n", stderr); return false;
     }
 
-    std::cout << "[4/5] Downloading libraries...\n";
+    fputs("[4/5] Downloading libraries...\n", stdout);
     fs::path lib_dir = root / "libraries";
-    for (size_t i = 0; i < vj["libraries"].size(); i++) {
-        auto& lib = vj["libraries"].arr[i];
+    for (size_t i = 0; i < vj["libraries"].size(); ++i) {
+        const auto& lib = vj["libraries"].arr[i];
         if (!lib_applies(lib)) continue;
 
         bool is_native = false;
-        std::string native_classifier;
+        std::string nat_cls;
         if (lib.has("natives") && lib["natives"].has("windows")) {
-            native_classifier = lib["natives"]["windows"].str();
-            std::string arch = (sizeof(void*) == 8) ? "64" : "32";
-            size_t pos = native_classifier.find("${arch}");
-            if (pos != std::string::npos)
-                native_classifier.replace(pos, 7, arch);
+            nat_cls = lib["natives"]["windows"].str();
+            const char* arch = sizeof(void*) == 8 ? "64" : "32";
+            size_t pos = nat_cls.find("${arch}");
+            if (pos != std::string::npos) nat_cls.replace(pos, 7, arch);
             is_native = true;
         }
 
-        auto try_download = [&](const std::string& classifier) {
-            if (lib.has("downloads")) {
-                const JVal* art = nullptr;
-                if (!classifier.empty() && lib["downloads"].has("classifiers")) {
-                    if (lib["downloads"]["classifiers"].has(classifier))
-                        art = &lib["downloads"]["classifiers"][classifier];
-                } else if (lib["downloads"].has("artifact")) {
-                    art = &lib["downloads"]["artifact"];
+        auto try_dl = [&](const std::string& cls) {
+            if (!lib.has("downloads")) return;
+            const JVal* art = nullptr;
+            if (!cls.empty()) {
+                if (lib["downloads"].has("classifiers") && lib["downloads"]["classifiers"].has(cls))
+                    art = &lib["downloads"]["classifiers"][cls];
+            } else if (lib["downloads"].has("artifact")) {
+                art = &lib["downloads"]["artifact"];
+            }
+            if (!art || art->is_null()) return;
+            const auto& u = (*art)["url"].str();
+            const auto& p = (*art)["path"].str();
+            if (u.empty() || p.empty()) return;
+            fs::path dest = lib_dir / p;
+            if (download_file(u, dest)) {
+                printf("  + %s\n", p.c_str());
+                if (is_native) {
+                    fs::path nat_dir = root / "natives";
+                    fs::create_directories(nat_dir);
+                    system(("tar -xf \"" + dest.string() + "\" -C \"" + nat_dir.string() + "\" --exclude=META-INF 2>NUL").c_str());
                 }
-                if (art && !art->is_null()) {
-                    std::string u = (*art)["url"].str();
-                    std::string p = (*art)["path"].str();
-                    if (!u.empty() && !p.empty()) {
-                        fs::path dest = lib_dir / p;
-                        if (!download_file(u, dest))
-                            std::cerr << "  warn: failed " << p << "\n";
-                        else
-                            std::cout << "  + " << p << "\n";
-                        if (is_native) {
-                            fs::path nat_dir = root / "natives";
-                            fs::create_directories(nat_dir);
-                            std::string cmd = "tar -xf \"" + dest.string() +
-                                "\" -C \"" + nat_dir.string() + "\" --exclude=META-INF 2>NUL";
-                            system(cmd.c_str());
-                        }
-                    }
-                }
+            } else {
+                fprintf(stderr, "  warn: failed %s\n", p.c_str());
             }
         };
 
-        if (is_native) try_download(native_classifier);
-        try_download("");
+        if (is_native) try_dl(nat_cls);
+        try_dl({});
     }
 
-    std::cout << "[5/5] Downloading assets...\n";
-    std::string idx_url = vj["assetIndex"]["url"].str();
-    std::string idx_id  = vj["assetIndex"]["id"].str();
+    fputs("[5/5] Downloading assets...\n", stdout);
+    const auto& idx_url = vj["assetIndex"]["url"].str();
+    const auto& idx_id  = vj["assetIndex"]["id"].str();
     fs::path idx_file   = root / "assets" / "indexes" / (idx_id + ".json");
     fs::create_directories(idx_file.parent_path());
 
     std::string idx_str;
     if (fs::exists(idx_file)) {
         std::ifstream f(idx_file);
-        idx_str = {std::istreambuf_iterator<char>(f), {}};
+        idx_str.assign(std::istreambuf_iterator<char>(f), {});
     } else {
-        idx_str = http_get(idx_url);
-        if (idx_str.empty()) { std::cerr << "Failed to fetch asset index.\n"; return false; }
+        idx_str = http_get_str(idx_url);
+        if (idx_str.empty()) { fputs("Failed to fetch asset index.\n", stderr); return false; }
         std::ofstream f(idx_file); f << idx_str;
     }
 
-    auto idx_json = parse_json(idx_str);
-    auto& objects = idx_json["objects"];
-    size_t total = objects.size(), done = 0;
-    for (auto& kv : objects.obj) {
-        auto& obj    = kv.second;
-        std::string hash   = obj["hash"].str();
-        std::string prefix = hash.substr(0, 2);
-        fs::path dest = root / "assets" / "objects" / prefix / hash;
-        if (!fs::exists(dest) || fs::file_size(dest) == 0) {
-            std::string url = RESOURCES_URL + prefix + "/" + hash;
-            download_file(url, dest);
-        }
-        done++;
+    const auto& objs = parse_json(idx_str)["objects"];
+    size_t total = objs.size(), done = 0;
+    for (const auto& kv : objs.obj) {
+        const auto& hash = kv.second["hash"].str();
+        std::string pfx  = hash.substr(0, 2);
+        fs::path dest    = root / "assets" / "objects" / pfx / hash;
+        if (!fs::exists(dest) || !fs::file_size(dest))
+            download_file(std::string(RESOURCES_URL) + pfx + "/" + hash, dest);
+        ++done;
         if (done % 50 == 0 || done == total)
-            std::cout << "  Assets: " << done << "/" << total << "\r" << std::flush;
+            printf("  Assets: %zu/%zu\r", done, total);
     }
-    std::cout << "\n";
+    putchar('\n');
     return true;
 }
 
-static std::string build_classpath(const fs::path& root, const JVal& vj, const std::string& version) {
+// ── Launch ────────────────────────────────────────────────────────────────────
+
+std::string build_classpath(const fs::path& root, const JVal& vj, const std::string& version) {
     std::string cp;
+    cp.reserve(4096);
     fs::path lib_dir = root / "libraries";
-    for (size_t i = 0; i < vj["libraries"].size(); i++) {
-        auto& lib = vj["libraries"].arr[i];
+    for (size_t i = 0; i < vj["libraries"].size(); ++i) {
+        const auto& lib = vj["libraries"].arr[i];
         if (!lib_applies(lib)) continue;
-        if (lib["natives"].has("windows")) continue;
+        if (lib.has("natives") && lib["natives"].has("windows")) continue;
         if (!lib.has("downloads") || !lib["downloads"].has("artifact")) continue;
-        std::string p = lib["downloads"]["artifact"]["path"].str();
+        const auto& p = lib["downloads"]["artifact"]["path"].str();
         if (p.empty()) continue;
         fs::path jar = lib_dir / p;
-        if (fs::exists(jar))
-            cp += jar.string() + ';';
+        if (fs::exists(jar)) { cp += jar.string(); cp += ';'; }
     }
-    fs::path client = root / "versions" / version / (version + ".jar");
-    cp += client.string();
+    cp += (root / "versions" / version / (version + ".jar")).string();
     return cp;
 }
 
-static bool launch_version(const fs::path& root, const Config& cfg, const std::string& version) {
-    fs::path ver_json_path = root / "versions" / version / (version + ".json");
-    if (!fs::exists(ver_json_path)) {
-        std::cerr << "Version " << version << " is not installed.\n";
-        return false;
-    }
+using VarMap = std::unordered_map<std::string, std::string>;
 
-    std::ifstream f(ver_json_path);
-    std::string s((std::istreambuf_iterator<char>(f)), {});
-    auto vj = parse_json(s);
+std::string tok_replace(const std::string& s, const VarMap& m) {
+    std::string r;
+    r.reserve(s.size() + 32);
+    for (size_t i = 0; i < s.size(); ) {
+        if (s[i] == '$' && i+1 < s.size() && s[i+1] == '{') {
+            size_t e = s.find('}', i+2);
+            if (e != std::string::npos) {
+                auto it = m.find(s.substr(i+2, e-i-2));
+                r += it != m.end() ? it->second : s.substr(i, e-i+1);
+                i = e+1; continue;
+            }
+        }
+        r += s[i++];
+    }
+    return r;
+}
+
+std::string win_quote(const std::string& s) {
+    if (s.find_first_of(" \t\"") == std::string::npos && !s.empty()) return s;
+    std::string r;
+    r.reserve(s.size() + 8);
+    r += '"';
+    int sl = 0;
+    for (char c : s) {
+        if      (c == '\\') { ++sl; }
+        else if (c == '"')  { r.append(sl*2+1,'\\'); r += '"'; sl = 0; }
+        else                { if (sl) { r.append(sl,'\\'); sl=0; } r += c; }
+    }
+    if (sl) r.append(sl*2, '\\');
+    r += '"';
+    return r;
+}
+
+bool launch_version(const fs::path& root, const Config& cfg, const std::string& version) {
+    fs::path vj_path = root / "versions" / version / (version + ".json");
+    if (!fs::exists(vj_path)) { fprintf(stderr, "Not installed: %s\n", version.c_str()); return false; }
+
+    std::ifstream f(vj_path);
+    auto vj = parse_json(std::string(std::istreambuf_iterator<char>(f), {}));
 
     std::string cp        = build_classpath(root, vj, version);
     std::string uuid      = make_offline_uuid(cfg.username);
     std::string nat       = (root / "natives").string();
+    std::string assets    = (root / "assets").string();
     std::string asset_idx = vj["assetIndex"]["id"].str();
-    std::string assets_dir = (root / "assets").string();
-    std::string game_dir   = root.string();
-    std::string jvm_args   = "-Xmx" + std::to_string(cfg.ram_gb) + "G -XX:+UseConcMarkSweepGC -XX:+CMSIncrementalMode";
+    std::string game_dir  = root.string();
+    std::string ver_type  = vj.has("type") ? vj["type"].str() : "release";
+    std::string main_cls  = vj["mainClass"].str();
+    if (main_cls.empty()) main_cls = "net.minecraft.client.main.Main";
 
-    std::ostringstream cmd;
-    cmd << "\"" << cfg.java_path << "\" "
-        << jvm_args << " "
-        << "-Djava.library.path=\"" << nat << "\" "
-        << "-cp \"" << cp << "\" "
-        << MAIN_CLASS << " "
-        << "--username "    << cfg.username   << " "
-        << "--version "     << version        << " "
-        << "--gameDir \""   << game_dir       << "\" "
-        << "--assetsDir \"" << assets_dir     << "\" "
-        << "--assetIndex "  << asset_idx      << " "
-        << "--uuid "        << uuid           << " "
-        << "--accessToken 0 "
-        << "--userType legacy";
+    VarMap vars = {
+        {"auth_player_name",  cfg.username},
+        {"auth_uuid",         uuid},
+        {"auth_access_token", "0"},
+        {"user_type",         "legacy"},
+        {"user_properties",   "{}"},
+        {"version_name",      version},
+        {"version_type",      ver_type},
+        {"game_directory",    game_dir},
+        {"assets_root",       assets},
+        {"game_assets",       assets},
+        {"assets_index_name", asset_idx},
+        {"natives_directory", nat},
+        {"classpath",         cp},
+        {"launcher_name",     "MCLauncher"},
+        {"launcher_version",  "2.0"},
+    };
 
-    std::string cmdstr = cmd.str();
-    std::cout << "\nLaunching Minecraft " << version << " as " << cfg.username << "...\n";
+    std::vector<std::string> args;
+    args.reserve(32);
+    args.push_back("-Xmx" + std::to_string(cfg.ram_gb) + "G");
+    args.push_back("-Xms512m");
 
-    STARTUPINFOW si{};
-    si.cb = sizeof(si);
+    if (required_jdk(version) <= 8) {
+        args.push_back("-XX:+UseConcMarkSweepGC");
+        args.push_back("-XX:+CMSIncrementalMode");
+    } else {
+        args.insert(args.end(), {
+            "-XX:+UseG1GC", "-XX:+UnlockExperimentalVMOptions",
+            "-XX:G1NewSizePercent=20", "-XX:G1ReservePercent=20",
+            "-XX:MaxGCPauseMillis=50", "-XX:G1HeapRegionSize=32M"
+        });
+    }
+
+    if (vj.has("arguments")) {
+        auto collect = [&](const JVal& arr, std::vector<std::string>& out) {
+            for (size_t i = 0; i < arr.size(); ++i) {
+                const auto& e = arr.arr[i];
+                if (e.is_string()) { out.push_back(tok_replace(e.str(), vars)); continue; }
+                if (!e.is_object()) continue;
+                bool ok = true;
+                if (e.has("rules")) {
+                    ok = false;
+                    for (size_t r = 0; r < e["rules"].size(); ++r) {
+                        const auto& rule = e["rules"].arr[r];
+                        bool match = !rule.has("os") || rule["os"]["name"].str() == "windows";
+                        if (rule.has("features")) match = false;
+                        if (match) ok = (rule["action"].str() == "allow");
+                    }
+                }
+                if (!ok) continue;
+                const auto& val = e["value"];
+                if (val.is_string()) out.push_back(tok_replace(val.str(), vars));
+                else if (val.is_array())
+                    for (size_t j = 0; j < val.size(); ++j)
+                        out.push_back(tok_replace(val.arr[j].str(), vars));
+            }
+        };
+        std::vector<std::string> jvm_a, game_a;
+        collect(vj["arguments"]["jvm"],  jvm_a);
+        collect(vj["arguments"]["game"], game_a);
+        for (auto& a : jvm_a)  args.push_back(a);
+        args.push_back(main_cls);
+        for (auto& a : game_a) args.push_back(a);
+    } else {
+        args.push_back("-Djava.library.path=" + nat);
+        args.push_back("-Dfile.encoding=UTF-8");
+        args.push_back("-cp");
+        args.push_back(cp);
+        args.push_back(main_cls);
+        const auto& mc_args = vj["minecraftArguments"].str();
+        for (size_t s = 0, e; s < mc_args.size(); s = e+1) {
+            e = mc_args.find(' ', s);
+            if (e == std::string::npos) { args.push_back(tok_replace(mc_args.substr(s), vars)); break; }
+            args.push_back(tok_replace(mc_args.substr(s, e-s), vars));
+        }
+    }
+
+    std::string cmd;
+    cmd.reserve(2048);
+    cmd = win_quote(cfg.java_path);
+    for (auto& a : args) { cmd += ' '; cmd += win_quote(a); }
+
+    printf("\nLaunching Minecraft %s as %s...\n[CMD] %s\n\n",
+           version.c_str(), cfg.username.c_str(), cmd.c_str());
+
+    STARTUPINFOW si{}; si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
+    std::wstring wcmd = to_wide(cmd);
+    wcmd += L'\0';
 
-    std::wstring wcmd = s2w(cmdstr);
-    std::vector<wchar_t> buf(wcmd.begin(), wcmd.end());
-    buf.push_back(0);
-    std::wstring wdir = s2w(game_dir);
-
-    if (!CreateProcessW(nullptr, buf.data(), nullptr, nullptr, FALSE,
-                        CREATE_NEW_CONSOLE, nullptr, wdir.c_str(), &si, &pi)) {
-        std::cerr << "Failed to launch: error " << GetLastError() << "\n";
+    if (!CreateProcessW(nullptr, wcmd.data(), nullptr, nullptr, FALSE,
+                        CREATE_NEW_CONSOLE, nullptr,
+                        to_wide(game_dir).c_str(), &si, &pi)) {
+        fprintf(stderr, "CreateProcess failed: %lu\n", GetLastError());
         return false;
     }
     CloseHandle(pi.hThread);
@@ -593,175 +794,150 @@ static bool launch_version(const fs::path& root, const Config& cfg, const std::s
     return true;
 }
 
-static std::vector<std::string> get_installed_versions(const fs::path& root) {
-    std::vector<std::string> versions;
+std::vector<std::string> get_installed_versions(const fs::path& root) {
+    std::vector<std::string> v;
     fs::path ver_dir = root / "versions";
-    if (!fs::exists(ver_dir)) return versions;
+    if (!fs::exists(ver_dir)) return v;
     std::error_code ec;
-    for (auto& entry : fs::directory_iterator(ver_dir, ec)) {
-        if (entry.is_directory(ec)) {
-            std::string name = entry.path().filename().string();
-            fs::path jar = entry.path() / (name + ".jar");
-            if (fs::exists(jar) && fs::file_size(jar) > 1024)
-                versions.push_back(name);
-        }
+    for (auto& e : fs::directory_iterator(ver_dir, ec)) {
+        if (!e.is_directory(ec)) continue;
+        std::string name = e.path().filename().string();
+        fs::path jar = e.path() / (name + ".jar");
+        if (fs::exists(jar) && fs::file_size(jar) > 1024) v.push_back(name);
     }
-    std::sort(versions.begin(), versions.end());
-    return versions;
+    std::sort(v.begin(), v.end());
+    return v;
 }
 
-static void print_header(const std::string& title) {
-    std::cout << "\n";
-    std::cout << "================================================\n";
-    std::cout << "  " << title << "\n";
-    std::cout << "================================================\n";
+void print_header(const char* title) {
+    printf("\n================================================\n  %s\n================================================\n", title);
 }
 
-static void section_download(const fs::path& root, Config& cfg, const fs::path& cfg_path) {
+void section_download(const fs::path& root, Config& cfg, const fs::path& cfg_path) {
     print_header("DOWNLOAD");
 
     auto manifest = fetch_manifest();
-    if (manifest.is_null()) {
-        std::cout << "Press Enter to continue...";
-        std::cin.get();
-        return;
-    }
+    if (manifest.is_null()) { fputs("Press Enter to continue...", stdout); std::cin.get(); return; }
 
-    struct VerEntry { std::string id, type; };
-    std::vector<VerEntry> entries;
-    for (size_t i = 0; i < manifest["versions"].size(); i++) {
-        auto& v = manifest["versions"].arr[i];
+    struct VE { std::string id, type; };
+    std::vector<VE> entries;
+    entries.reserve(manifest["versions"].size());
+    for (size_t i = 0; i < manifest["versions"].size(); ++i) {
+        const auto& v = manifest["versions"].arr[i];
         entries.push_back({v["id"].str(), v["type"].str()});
     }
 
-    std::cout << "\nFilter: (1) Releases only  (2) All versions\nChoice: ";
-    std::string filter_in;
-    std::getline(std::cin, filter_in);
-    bool releases_only = (filter_in != "2");
+    fputs("\nFilter: (1) Releases only  (2) All versions\nChoice: ", stdout);
+    std::string fin;
+    std::getline(std::cin, fin);
+    bool releases_only = (fin != "2");
 
-    std::vector<VerEntry> filtered;
-    for (auto& e : entries) {
-        if (releases_only && e.type != "release") continue;
-        filtered.push_back(e);
-    }
+    std::vector<VE> filtered;
+    filtered.reserve(entries.size());
+    for (auto& e : entries)
+        if (!releases_only || e.type == "release") filtered.push_back(e);
 
     int page = 0;
-    const int PAGE_SIZE = 20;
-    while (true) {
-        int total_pages = ((int)filtered.size() + PAGE_SIZE - 1) / PAGE_SIZE;
-        int start = page * PAGE_SIZE;
-        int end   = std::min(start + PAGE_SIZE, (int)filtered.size());
+    const int PAGE = 20;
+    for (;;) {
+        int pages = ((int)filtered.size() + PAGE - 1) / PAGE;
+        int start = page * PAGE;
+        int end   = std::min(start + PAGE, (int)filtered.size());
 
-        std::cout << "\nVersions (page " << (page + 1) << "/" << total_pages << "):\n";
-        for (int i = start; i < end; i++) {
-            std::cout << "  [" << (i - start + 1) << "] " << filtered[i].id;
-            if (filtered[i].type != "release") std::cout << " (" << filtered[i].type << ")";
-            std::cout << "\n";
+        printf("\nVersions (page %d/%d):\n", page+1, pages);
+        for (int i = start; i < end; ++i) {
+            printf("  [%d] %s", i-start+1, filtered[i].id.c_str());
+            if (filtered[i].type != "release") printf(" (%s)", filtered[i].type.c_str());
+            putchar('\n');
         }
-        std::cout << "\nEnter number to select, 'n' next page, 'p' prev page, 'q' cancel: ";
+        fputs("\nEnter number, 'n' next, 'p' prev, 'q' cancel: ", stdout);
         std::string input;
         std::getline(std::cin, input);
 
         if (input == "q" || input == "Q") return;
-        if (input == "n" || input == "N") { if (page + 1 < total_pages) page++; continue; }
-        if (input == "p" || input == "P") { if (page > 0) page--; continue; }
+        if (input == "n" || input == "N") { if (page+1 < pages) ++page; continue; }
+        if (input == "p" || input == "P") { if (page > 0) --page; continue; }
 
         try {
             int idx = std::stoi(input) - 1 + start;
-            if (idx < 0 || idx >= (int)filtered.size()) { std::cout << "Invalid selection.\n"; continue; }
-            std::string chosen = filtered[idx].id;
+            if (idx < 0 || idx >= (int)filtered.size()) { fputs("Invalid selection.\n", stdout); continue; }
+            const std::string& chosen = filtered[idx].id;
 
             fs::path jar = root / "versions" / chosen / (chosen + ".jar");
-            bool installed = fs::exists(jar) && fs::file_size(jar) > 1024;
-            if (installed) {
-                std::cout << "\nVersion " << chosen << " is already installed.\n";
+            if (fs::exists(jar) && fs::file_size(jar) > 1024) {
+                printf("\nVersion %s is already installed.\n", chosen.c_str());
             } else {
-                std::cout << "\nDownload Minecraft " << chosen << "? (y/n): ";
+                printf("\nDownload Minecraft %s? (y/n): ", chosen.c_str());
                 std::string ans;
                 std::getline(std::cin, ans);
                 if (ans.empty() || (ans[0] != 'y' && ans[0] != 'Y')) return;
-
-                if (!install_bundled_jre(root, cfg, cfg_path)) {
-                    std::cout << "Continuing without bundled JRE. Ensure Java is available.\n";
-                }
-
-                std::cout << "\n[1/5] Manifest already fetched.\n";
-                if (!download_minecraft(root, chosen)) {
-                    std::cerr << "\nDownload failed.\n";
-                } else {
-                    std::cout << "\nDownload complete! Version " << chosen << " is ready.\n";
-                }
+                if (!install_bundled_jre(root, cfg, cfg_path, chosen))
+                    fputs("Continuing without bundled JDK.\n", stdout);
+                fputs("\n[1/5] Manifest already fetched.\n", stdout);
+                if (!download_minecraft(root, chosen))
+                    fputs("\nDownload failed.\n", stderr);
+                else
+                    printf("\nDownload complete! %s is ready.\n", chosen.c_str());
             }
-            std::cout << "Press Enter to continue...";
-            std::cin.get();
+            fputs("Press Enter to continue...", stdout); std::cin.get();
             return;
-        } catch (...) {
-            std::cout << "Invalid input.\n";
-        }
+        } catch (...) { fputs("Invalid input.\n", stdout); }
     }
 }
 
-static void section_settings(Config& cfg, const fs::path& cfg_path) {
-    while (true) {
+void section_settings(Config& cfg, const fs::path& cfg_path) {
+    for (;;) {
         print_header("SETTINGS");
-        std::cout << "  [1] Username   : " << cfg.username  << "\n";
-        std::cout << "  [2] RAM (GB)   : " << cfg.ram_gb   << "GB\n";
-        std::cout << "  [3] Java Path  : " << cfg.java_path << "\n";
-        std::cout << "  [4] Back\n";
-        std::cout << "\nChoice: ";
+        printf("  [1] Username   : %s\n"
+               "  [2] RAM (GB)   : %dGB\n"
+               "  [3] Java Path  : %s\n"
+               "  [4] Back\n\nChoice: ",
+               cfg.username.c_str(), cfg.ram_gb, cfg.java_path.c_str());
 
         std::string input;
         std::getline(std::cin, input);
 
         if (input == "1") {
-            std::cout << "New username [" << cfg.username << "]: ";
-            std::string val;
-            std::getline(std::cin, val);
+            printf("New username [%s]: ", cfg.username.c_str());
+            std::string val; std::getline(std::cin, val);
             if (!val.empty()) cfg.username = val;
         } else if (input == "2") {
-            std::cout << "RAM in GB [" << cfg.ram_gb << "]: ";
-            std::string val;
-            std::getline(std::cin, val);
+            printf("RAM in GB [%d]: ", cfg.ram_gb);
+            std::string val; std::getline(std::cin, val);
             try {
                 int gb = std::stoi(val);
                 if (gb >= 1 && gb <= 64) cfg.ram_gb = gb;
-                else std::cout << "Invalid value. Must be 1-64.\n";
+                else fputs("Invalid. Must be 1-64.\n", stdout);
             } catch (...) {}
         } else if (input == "3") {
-            std::cout << "Java executable path [" << cfg.java_path << "]: ";
-            std::string val;
-            std::getline(std::cin, val);
+            printf("Java path [%s]: ", cfg.java_path.c_str());
+            std::string val; std::getline(std::cin, val);
             if (!val.empty()) {
-                if (!check_java(val)) {
-                    std::cout << "Warning: could not verify java at that path.\n";
-                }
+                if (!check_java(val)) fputs("Warning: could not verify java at that path.\n", stdout);
                 cfg.java_path = val;
             }
         } else if (input == "4" || input == "q" || input == "Q") {
             break;
         }
-
         save_config(cfg, cfg_path);
-        std::cout << "Settings saved.\n";
+        fputs("Settings saved.\n", stdout);
     }
 }
 
-static void section_launch(const fs::path& root, Config& cfg, const fs::path& cfg_path) {
+void section_launch(const fs::path& root, Config& cfg, const fs::path& cfg_path) {
     print_header("LAUNCH");
-
     auto versions = get_installed_versions(root);
     if (versions.empty()) {
-        std::cout << "\nNo installed versions found. Go to Download first.\n";
-        std::cout << "Press Enter to continue...";
+        fputs("\nNo installed versions. Go to Download first.\nPress Enter to continue...", stdout);
         std::cin.get();
         return;
     }
 
-    std::cout << "\nInstalled versions:\n";
-    for (size_t i = 0; i < versions.size(); i++) {
-        std::cout << "  [" << (i + 1) << "] " << versions[i] << "\n";
-    }
-    std::cout << "\nSelect version (or 'q' to cancel): ";
+    fputs("\nInstalled versions:\n", stdout);
+    for (size_t i = 0; i < versions.size(); ++i)
+        printf("  [%zu] %s\n", i+1, versions[i].c_str());
+    fputs("\nSelect version (or 'q' to cancel): ", stdout);
+
     std::string input;
     std::getline(std::cin, input);
     if (input == "q" || input == "Q") return;
@@ -769,77 +945,60 @@ static void section_launch(const fs::path& root, Config& cfg, const fs::path& cf
     try {
         int idx = std::stoi(input) - 1;
         if (idx < 0 || idx >= (int)versions.size()) {
-            std::cout << "Invalid selection.\n";
-            std::cout << "Press Enter to continue...";
+            fputs("Invalid selection.\nPress Enter to continue...", stdout);
             std::cin.get();
             return;
         }
-        std::string chosen = versions[idx];
-
+        const std::string& chosen = versions[idx];
         if (!check_java(cfg.java_path)) {
-            std::cout << "\nJava not found at: " << cfg.java_path << "\n";
-            std::cout << "Attempting to locate bundled JRE...\n";
-            if (!install_bundled_jre(root, cfg, cfg_path)) {
-                std::cerr << "Java unavailable. Set Java Path in Settings.\n";
-                std::cout << "Press Enter to continue...";
+            printf("\nJava not found at: %s\nLocating bundled JDK...\n", cfg.java_path.c_str());
+            if (!install_bundled_jre(root, cfg, cfg_path, chosen)) {
+                fputs("Java unavailable. Set Java Path in Settings.\nPress Enter to continue...", stderr);
                 std::cin.get();
                 return;
             }
         }
-
         if (!launch_version(root, cfg, chosen)) {
-            std::cout << "Press Enter to continue...";
+            fputs("Press Enter to continue...", stdout);
             std::cin.get();
         } else {
-            std::cout << "Game launched! Exiting launcher...\n";
+            fputs("Game launched! Exiting launcher...\n", stdout);
             Sleep(1500);
         }
     } catch (...) {
-        std::cout << "Invalid input.\n";
-        std::cout << "Press Enter to continue...";
+        fputs("Invalid input.\nPress Enter to continue...", stdout);
         std::cin.get();
     }
 }
 
+} // namespace
+
 int main() {
     SetConsoleOutputCP(CP_UTF8);
 
-    wchar_t exe_path[MAX_PATH]{};
-    GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
-    fs::path root = fs::path(exe_path).parent_path();
-
+    wchar_t exe[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    fs::path root     = fs::path(exe).parent_path();
     fs::path cfg_path = root / "config.json";
-    Config cfg = load_config(cfg_path);
+    Config   cfg      = load_config(cfg_path);
 
     if (cfg.username.empty() || cfg.username == "Player") {
-        std::cout << "=== Minecraft Launcher ===\n\n";
-        std::cout << "Enter your username: ";
+        fputs("=== Minecraft Launcher ===\n\nEnter your username: ", stdout);
         std::getline(std::cin, cfg.username);
         if (cfg.username.empty()) cfg.username = "Player";
         save_config(cfg, cfg_path);
     }
 
-    while (true) {
+    for (;;) {
         print_header("MINECRAFT LAUNCHER");
-        std::cout << "  [1] Download\n";
-        std::cout << "  [2] Settings\n";
-        std::cout << "  [3] Launch\n";
-        std::cout << "  [4] Exit\n";
-        std::cout << "\nChoice: ";
-
+        fputs("  [1] Download\n  [2] Settings\n  [3] Launch\n  [4] Exit\n\nChoice: ", stdout);
         std::string input;
         std::getline(std::cin, input);
 
-        if (input == "1") {
-            section_download(root, cfg, cfg_path);
-        } else if (input == "2") {
-            section_settings(cfg, cfg_path);
-        } else if (input == "3") {
-            section_launch(root, cfg, cfg_path);
-        } else if (input == "4" || input == "q" || input == "Q") {
-            break;
-        }
+        if      (input == "1") section_download(root, cfg, cfg_path);
+        else if (input == "2") section_settings(cfg, cfg_path);
+        else if (input == "3") section_launch(root, cfg, cfg_path);
+        else if (input == "4" || input == "q" || input == "Q") break;
     }
-
     return 0;
 }
