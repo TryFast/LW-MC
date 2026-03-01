@@ -604,7 +604,8 @@ bool download_minecraft(const fs::path& root, const std::string& version) {
         std::ofstream f(idx_file); f << idx_str;
     }
 
-    const auto& objs = parse_json(idx_str)["objects"];
+    auto idx_json = parse_json(idx_str);
+    const auto& objs = idx_json["objects"];
     size_t total = objs.size(), done = 0;
     for (const auto& kv : objs.obj) {
         const auto& hash = kv.second["hash"].str();
@@ -1002,3 +1003,4 @@ int main() {
     }
     return 0;
 }
+
