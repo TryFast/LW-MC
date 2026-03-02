@@ -301,7 +301,7 @@ bool http_download(const std::string& url, const fs::path& dest) {
 
 struct Config {
     std::string username  = "Player";
-    std::string java_path = "java";
+    std::string java_path = "javaw";
     int         ram_gb    = 2;
 };
 
@@ -374,6 +374,19 @@ inline int required_jdk(const std::string& mc) {
     return 21;
 }
 
+// Returns the Mojang runtime component name based purely on version ranges:
+//   <= 1.16.x   -> jre-legacy          (Java 8,  Oracle JRE)
+//   1.17-1.20.4 -> java-runtime-gamma  (Java 17)
+//   1.20.5+     -> java-runtime-delta  (Java 21)
+std::string get_runtime_component_for_version(const std::string& mc) {
+    static const MCVer v117  = parse_mc_ver("1.17");
+    static const MCVer v1205 = parse_mc_ver("1.20.5");
+    MCVer v = parse_mc_ver(mc);
+    if (cmp_ver(v, v117)  < 0) return "jre-legacy";
+    if (cmp_ver(v, v1205) < 0) return "java-runtime-gamma";
+    return "java-runtime-delta";
+}
+
 // ── Minecraft helpers ─────────────────────────────────────────────────────────
 
 std::string make_offline_uuid(const std::string& name) {
@@ -428,73 +441,96 @@ bool download_file(const std::string& url, const fs::path& dest) {
 static const char* MANIFEST_URL  = "https://launchermeta.mojang.com/mc/game/version_manifest.json";
 static const char* RESOURCES_URL = "https://resources.download.minecraft.net/";
 
-// ── JDK install ───────────────────────────────────────────────────────────────
+// ── Mojang JRE install ────────────────────────────────────────────────────────
 
-std::string get_adoptium_url(int jdk) {
-    std::string api = "https://api.adoptium.net/v3/assets/latest/" +
-                      std::to_string(jdk) +
-                      "/hotspot?architecture=x64&image_type=jdk&os=windows";
-    printf("  Querying Adoptium API for JDK %d...\n", jdk);
-    std::string resp = http_get_str(api);
-    if (resp.empty()) { fputs("  Adoptium API unreachable.\n", stderr); return {}; }
-    auto j = parse_json(resp);
-    if (!j.is_array() || !j.size()) { fputs("  No packages in response.\n", stderr); return {}; }
-    for (size_t i = 0; i < j.size(); ++i) {
-        const auto& pkg  = j[i]["binary"]["package"];
-        const auto& name = pkg["name"].str();
-        if (name.size() >= 4 && name.compare(name.size()-4, 4, ".zip") == 0) {
-            const auto& url = pkg["link"].str();
-            if (!url.empty()) return url;
-        }
-    }
-    fputs("  No .zip in Adoptium response.\n", stderr);
-    return {};
-}
+static const char* RUNTIME_ALL_URL =
+    "https://launchermeta.mojang.com/v1/products/java-runtime/"
+    "2ec0cc96c44e5a76b9c8b7c39df7210883d12871/all.json";
 
 bool install_bundled_jre(const fs::path& root, Config& cfg, const fs::path& cfg_path,
                          const std::string& mc_ver = "") {
-    int jdk = mc_ver.empty() ? 8 : required_jdk(mc_ver);
-    fs::path jdk_dir = root / ("jdk" + std::to_string(jdk));
+    std::string component = mc_ver.empty() ? "jre-legacy"
+                                           : get_runtime_component_for_version(mc_ver);
+    fs::path jre_dir = root / "runtime" / component;
 
-    std::string existing = find_java_in_dir(jdk_dir);
+    // Already installed?
+    std::string existing = find_java_in_dir(jre_dir);
     if (!existing.empty()) {
-        printf("  Found Temurin JDK %d: %s\n", jdk, existing.c_str());
+        printf("  Found Mojang JRE (%s): %s\n", component.c_str(), existing.c_str());
         cfg.java_path = existing;
         save_config(cfg, cfg_path);
         return true;
     }
 
-    printf("\nRequires Java %d. No bundled JDK in: %s\n", jdk, jdk_dir.string().c_str());
-    printf("Download Eclipse Adoptium Temurin JDK %d automatically? (y/n): ", jdk);
+    printf("\nNo bundled JRE found for '%s'.\n", component.c_str());
+    printf("Download Mojang JRE (%s) automatically? (y/n): ", component.c_str());
     std::string ans;
     std::getline(std::cin, ans);
     if (ans.empty() || (ans[0] != 'y' && ans[0] != 'Y')) return false;
 
-    std::string dl_url = get_adoptium_url(jdk);
-    if (dl_url.empty()) return false;
+    // Step 1: fetch all.json
+    fputs("  Fetching Mojang runtime index...\n", stdout);
+    std::string all_str = http_get_str(RUNTIME_ALL_URL);
+    if (all_str.empty()) { fputs("  Failed to fetch runtime index.\n", stderr); return false; }
+    auto all_j = parse_json(all_str);
 
-    std::string zip_name = dl_url.substr(dl_url.rfind('/') + 1);
-    if (zip_name.empty()) zip_name = "temurin-jdk" + std::to_string(jdk) + ".zip";
-    fs::path zip_dest = root / zip_name;
+    const char* platform = "windows-x64";
+    if (!all_j.has(platform) || !all_j[platform].has(component)) {
+        fprintf(stderr, "  Component '%s' not found for %s.\n", component.c_str(), platform);
+        return false;
+    }
+    const auto& comp_arr = all_j[platform][component];
+    if (!comp_arr.is_array() || !comp_arr.size()) {
+        fputs("  Empty component entry.\n", stderr); return false;
+    }
+    std::string manifest_url = comp_arr[0]["manifest"]["url"].str();
+    if (manifest_url.empty()) { fputs("  No manifest URL.\n", stderr); return false; }
 
-    printf("  Downloading: %s\n", dl_url.c_str());
-    if (!download_file(dl_url, zip_dest)) { fputs("  Download failed.\n", stderr); return false; }
+    // Step 2: fetch file manifest
+    printf("  Fetching file manifest for '%s'...\n", component.c_str());
+    std::string mf_str = http_get_str(manifest_url);
+    if (mf_str.empty()) { fputs("  Failed to fetch file manifest.\n", stderr); return false; }
+    auto mf = parse_json(mf_str);
 
-    printf("  Extracting to: %s\n", jdk_dir.string().c_str());
-    fs::create_directories(jdk_dir);
+    // Step 3: download every file
+    fs::create_directories(jre_dir);
+    const auto& files = mf["files"];
+    size_t total = files.size(), done = 0;
+    printf("  Downloading %zu files...\n", total);
 
-    std::string cmd = "powershell -NoProfile -Command \"Expand-Archive -Force -LiteralPath '"
-                    + zip_dest.string() + "' -DestinationPath '" + jdk_dir.string() + "'\"";
-    int ret = system(cmd.c_str());
-    if (ret != 0) { fprintf(stderr, "  Extraction failed (exit %d).\n", ret); return false; }
+    for (const auto& kv : files.obj) {
+        const std::string& rel_path = kv.first;
+        const JVal& entry           = kv.second;
+        const std::string& type     = entry["type"].str();
+        ++done;
 
-    std::error_code ec;
-    fs::remove(zip_dest, ec);
+        if (type == "directory") {
+            fs::create_directories(jre_dir / rel_path);
+            continue;
+        }
+        if (type != "file") continue;
+        if (!entry.has("downloads") || !entry["downloads"].has("raw")) continue;
 
-    std::string found = find_java_in_dir(jdk_dir);
-    if (found.empty()) { fprintf(stderr, "javaw.exe not found in jdk%d after extraction.\n", jdk); return false; }
+        std::string dl_url = entry["downloads"]["raw"]["url"].str();
+        if (dl_url.empty()) continue;
 
-    printf("Temurin JDK %d installed: %s\n", jdk, found.c_str());
+        fs::path dest = jre_dir / rel_path;
+        fs::create_directories(dest.parent_path());
+        if (!download_file(dl_url, dest))
+            fprintf(stderr, "  [FAIL] %s\n", rel_path.c_str());
+
+        if (done % 20 == 0 || done == total)
+            printf("  Progress: %zu/%zu\r", done, total);
+    }
+    putchar('\n');
+
+    std::string found = find_java_in_dir(jre_dir);
+    if (found.empty()) {
+        fprintf(stderr, "  javaw.exe not found after install in: %s\n", jre_dir.string().c_str());
+        return false;
+    }
+
+    printf("  Mojang JRE (%s) installed: %s\n", component.c_str(), found.c_str());
     cfg.java_path = found;
     save_config(cfg, cfg_path);
     return true;
@@ -575,7 +611,7 @@ bool download_minecraft(const fs::path& root, const std::string& version) {
             if (download_file(u, dest)) {
                 printf("  + %s\n", p.c_str());
                 if (is_native) {
-                    fs::path nat_dir = root / "natives";
+                    fs::path nat_dir = root / "versions" / version / "natives";
                     fs::create_directories(nat_dir);
                     system(("tar -xf \"" + dest.string() + "\" -C \"" + nat_dir.string() + "\" --exclude=META-INF 2>NUL").c_str());
                 }
@@ -685,7 +721,7 @@ bool launch_version(const fs::path& root, const Config& cfg, const std::string& 
 
     std::string cp        = build_classpath(root, vj, version);
     std::string uuid      = make_offline_uuid(cfg.username);
-    std::string nat       = (root / "natives").string();
+    std::string nat       = (root / "versions" / version / "natives").string();
     std::string assets    = (root / "assets").string();
     std::string asset_idx = vj["assetIndex"]["id"].str();
     std::string game_dir  = root.string();
@@ -719,6 +755,7 @@ bool launch_version(const fs::path& root, const Config& cfg, const std::string& 
     if (required_jdk(version) <= 8) {
         args.push_back("-XX:+UseConcMarkSweepGC");
         args.push_back("-XX:+CMSIncrementalMode");
+        args.push_back("-XX:HeapDumpPath=MojangTricksIntelDriversForPerformance_javaw.exe_minecraft.exe.heapdump");
     } else {
         args.insert(args.end(), {
             "-XX:+UseG1GC", "-XX:+UnlockExperimentalVMOptions",
@@ -759,6 +796,7 @@ bool launch_version(const fs::path& root, const Config& cfg, const std::string& 
         for (auto& a : game_a) args.push_back(a);
     } else {
         args.push_back("-Djava.library.path=" + nat);
+        args.push_back("-Dorg.lwjgl.librarypath=" + nat);
         args.push_back("-Dfile.encoding=UTF-8");
         args.push_back("-cp");
         args.push_back(cp);
@@ -771,9 +809,19 @@ bool launch_version(const fs::path& root, const Config& cfg, const std::string& 
         }
     }
 
+    std::string java_exec = cfg.java_path;
+    {
+        size_t pos = java_exec.find("java.exe");
+        if (pos != std::string::npos)
+            java_exec.replace(pos, 8, "javaw.exe");
+        else if (java_exec.size() >= 4 &&
+                 java_exec.compare(java_exec.size()-4, 4, "java") == 0 &&
+                 (java_exec.size() == 4 || java_exec[java_exec.size()-5] == '\\' || java_exec[java_exec.size()-5] == '/'))
+            java_exec += "w";
+    }
     std::string cmd;
     cmd.reserve(2048);
-    cmd = win_quote(cfg.java_path);
+    cmd = win_quote(java_exec);
     for (auto& a : args) { cmd += ' '; cmd += win_quote(a); }
 
     printf("\nLaunching Minecraft %s as %s...\n[CMD] %s\n\n",
@@ -873,7 +921,7 @@ void section_download(const fs::path& root, Config& cfg, const fs::path& cfg_pat
                 std::getline(std::cin, ans);
                 if (ans.empty() || (ans[0] != 'y' && ans[0] != 'Y')) return;
                 if (!install_bundled_jre(root, cfg, cfg_path, chosen))
-                    fputs("Continuing without bundled JDK.\n", stdout);
+                    fputs("Continuing without bundled JRE.\n", stdout);
                 fputs("\n[1/5] Manifest already fetched.\n", stdout);
                 if (!download_minecraft(root, chosen))
                     fputs("\nDownload failed.\n", stderr);
@@ -952,7 +1000,7 @@ void section_launch(const fs::path& root, Config& cfg, const fs::path& cfg_path)
         }
         const std::string& chosen = versions[idx];
         if (!check_java(cfg.java_path)) {
-            printf("\nJava not found at: %s\nLocating bundled JDK...\n", cfg.java_path.c_str());
+            printf("\nJava not found at: %s\nLocating bundled JRE...\n", cfg.java_path.c_str());
             if (!install_bundled_jre(root, cfg, cfg_path, chosen)) {
                 fputs("Java unavailable. Set Java Path in Settings.\nPress Enter to continue...", stderr);
                 std::cin.get();
@@ -1003,4 +1051,3 @@ int main() {
     }
     return 0;
 }
-
