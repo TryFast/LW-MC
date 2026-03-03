@@ -1,7 +1,3 @@
-/*
- * Compile: g++ -std=c++17 -O2 -o launcher.exe launcher.cpp -lwinhttp -lshell32
- */
-
 #define UNICODE
 #define _UNICODE
 #define WIN32_LEAN_AND_MEAN
@@ -18,12 +14,13 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <thread>
+#include <atomic>
+#include <mutex>
 
 #pragma comment(lib, "winhttp.lib")
 
 namespace fs = std::filesystem;
-
-// ── JSON ──────────────────────────────────────────────────────────────────────
 
 struct JVal {
     enum Type : uint8_t { Null, Bool, Num, Str, Arr, Obj } type = Null;
@@ -33,10 +30,10 @@ struct JVal {
     std::vector<JVal>                         arr;
     std::vector<std::pair<std::string, JVal>> obj;
 
-    inline bool is_null()   const { return type == Null; }
-    inline bool is_string() const { return type == Str;  }
-    inline bool is_array()  const { return type == Arr;  }
-    inline bool is_object() const { return type == Obj;  }
+    bool is_null()   const { return type == Null; }
+    bool is_string() const { return type == Str;  }
+    bool is_array()  const { return type == Arr;  }
+    bool is_object() const { return type == Obj;  }
 
     const JVal& operator[](const std::string& k) const {
         for (auto& p : obj) if (p.first == k) return p.second;
@@ -48,6 +45,7 @@ struct JVal {
         return obj.back().second;
     }
     const JVal& operator[](size_t i) const { return arr[i]; }
+    JVal&       operator[](size_t i)       { return arr[i]; }
 
     bool has(const std::string& k) const {
         for (auto& p : obj) if (p.first == k) return true;
@@ -58,13 +56,11 @@ struct JVal {
     size_t             size() const { return type == Arr ? arr.size() : obj.size(); }
 };
 
-namespace {
-
-inline void skip_ws(const char*& p) {
+static inline void skip_ws(const char*& p) {
     while ((*p == ' ') | (*p == '\t') | (*p == '\r') | (*p == '\n')) ++p;
 }
 
-std::string parse_str_tok(const char*& p) {
+static std::string parse_str_tok(const char*& p) {
     ++p;
     std::string s;
     s.reserve(64);
@@ -89,9 +85,9 @@ std::string parse_str_tok(const char*& p) {
     return s;
 }
 
-JVal parse_val(const char*& p);
+static JVal parse_val(const char*& p);
 
-JVal parse_obj(const char*& p) {
+static JVal parse_obj(const char*& p) {
     JVal v; v.type = JVal::Obj;
     ++p;
     for (;;) {
@@ -109,7 +105,7 @@ JVal parse_obj(const char*& p) {
     return v;
 }
 
-JVal parse_arr(const char*& p) {
+static JVal parse_arr(const char*& p) {
     JVal v; v.type = JVal::Arr;
     ++p;
     for (;;) {
@@ -123,7 +119,7 @@ JVal parse_arr(const char*& p) {
     return v;
 }
 
-JVal parse_val(const char*& p) {
+static JVal parse_val(const char*& p) {
     skip_ws(p);
     switch (*p) {
         case '{': return parse_obj(p);
@@ -138,23 +134,21 @@ JVal parse_val(const char*& p) {
     return v;
 }
 
-JVal parse_json(const std::string& src) {
+static JVal parse_json(const std::string& src) {
     const char* p = src.c_str();
     return parse_val(p);
 }
 
-// ── WinHTTP ───────────────────────────────────────────────────────────────────
-
-inline std::wstring to_wide(const char* s, int len = -1) {
+static inline std::wstring to_wide(const char* s, int len = -1) {
     if (!s || !*s) return {};
     int n = MultiByteToWideChar(CP_UTF8, 0, s, len, nullptr, 0);
     std::wstring w(n, L'\0');
     MultiByteToWideChar(CP_UTF8, 0, s, len, w.data(), n);
     return w;
 }
-inline std::wstring to_wide(const std::string& s) { return to_wide(s.c_str(), (int)s.size()); }
+static inline std::wstring to_wide(const std::string& s) { return to_wide(s.c_str(), (int)s.size()); }
 
-inline std::string to_utf8(const wchar_t* w, int len = -1) {
+static inline std::string to_utf8(const wchar_t* w, int len = -1) {
     if (!w || !*w) return {};
     int n = WideCharToMultiByte(CP_UTF8, 0, w, len, nullptr, 0, nullptr, nullptr);
     std::string s(n, '\0');
@@ -165,7 +159,7 @@ inline std::string to_utf8(const wchar_t* w, int len = -1) {
 struct WSession {
     HINTERNET h = nullptr;
     WSession() {
-        h = WinHttpOpen(L"MCLauncher/2.0",
+        h = WinHttpOpen(L"MCLauncher/3.0",
             WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
             WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
         if (h) {
@@ -180,7 +174,7 @@ struct WSession {
 
 struct CrackResult { std::wstring host, path; INTERNET_PORT port; bool https; };
 
-CrackResult crack_url(const std::wstring& url) {
+static CrackResult crack_url(const std::wstring& url) {
     CrackResult r{};
     URL_COMPONENTS uc{};
     uc.dwStructSize = sizeof(uc);
@@ -195,9 +189,7 @@ CrackResult crack_url(const std::wstring& url) {
     return r;
 }
 
-// Opens a GET request following up to max_redir redirects.
-// Caller must close out_conn and returned handle on success.
-HINTERNET open_req(const std::string& url_s, HINTERNET& out_conn, int max_redir = 10) {
+static HINTERNET open_req(const std::string& url_s, HINTERNET& out_conn, int max_redir = 10) {
     if (!g_sess.h) return nullptr;
     std::string cur = url_s;
 
@@ -253,14 +245,14 @@ HINTERNET open_req(const std::string& url_s, HINTERNET& out_conn, int max_redir 
     return nullptr;
 }
 
-std::string http_get_str(const std::string& url) {
+static std::string http_get_str(const std::string& url) {
     HINTERNET hConn = nullptr;
     HINTERNET hReq  = open_req(url, hConn);
     if (!hReq) return {};
 
     std::string result;
     result.reserve(65536);
-    char buf[8192];
+    char buf[65536];
     DWORD read = 0;
     while (WinHttpReadData(hReq, buf, sizeof(buf), &read) && read) result.append(buf, read);
 
@@ -268,14 +260,17 @@ std::string http_get_str(const std::string& url) {
     return result;
 }
 
-// Streams response directly to file — no full-body allocation.
-// Critical for large downloads (JDK zips, client JARs).
-bool http_download(const std::string& url, const fs::path& dest) {
+static std::mutex g_mkdir_mtx;
+
+static bool http_download(const std::string& url, const fs::path& dest) {
     HINTERNET hConn = nullptr;
     HINTERNET hReq  = open_req(url, hConn);
     if (!hReq) return false;
 
-    fs::create_directories(dest.parent_path());
+    {
+        std::lock_guard<std::mutex> lk(g_mkdir_mtx);
+        fs::create_directories(dest.parent_path());
+    }
 
     HANDLE hFile = CreateFileW(dest.c_str(), GENERIC_WRITE, 0, nullptr,
                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -285,7 +280,7 @@ bool http_download(const std::string& url, const fs::path& dest) {
     }
 
     bool ok = true;
-    char buf[65536];
+    char buf[131072];
     DWORD read = 0, written = 0;
     while (WinHttpReadData(hReq, buf, sizeof(buf), &read) && read) {
         if (!WriteFile(hFile, buf, read, &written, nullptr) || written != read) { ok = false; break; }
@@ -293,11 +288,41 @@ bool http_download(const std::string& url, const fs::path& dest) {
 
     CloseHandle(hFile);
     WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConn);
-    if (!ok) fs::remove(dest);
+    if (!ok) { std::error_code ec; fs::remove(dest, ec); }
     return ok;
 }
 
-// ── Config ────────────────────────────────────────────────────────────────────
+static bool download_file(const std::string& url, const fs::path& dest) {
+    if (fs::exists(dest) && fs::file_size(dest) > 0) return true;
+    return http_download(url, dest);
+}
+
+struct DLTask { std::string url; fs::path dest; };
+
+static void parallel_dl(std::vector<DLTask>& tasks, int nthreads = 16) {
+    if (tasks.empty()) return;
+    std::atomic<size_t> cursor{0}, ndone{0};
+    size_t total = tasks.size();
+
+    auto worker = [&]() {
+        for (size_t i; (i = cursor.fetch_add(1, std::memory_order_relaxed)) < total; ) {
+            download_file(tasks[i].url, tasks[i].dest);
+            ndone.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
+
+    int n = std::min(nthreads, (int)total);
+    std::vector<std::thread> pool(n);
+    for (auto& t : pool) t = std::thread(worker);
+
+    while (ndone.load(std::memory_order_relaxed) < total) {
+        printf("  %zu/%zu\r", ndone.load(std::memory_order_relaxed), total);
+        fflush(stdout);
+        Sleep(100);
+    }
+    for (auto& t : pool) t.join();
+    printf("  %zu/%zu\n", total, total);
+}
 
 struct Config {
     std::string username  = "Player";
@@ -305,7 +330,7 @@ struct Config {
     int         ram_gb    = 2;
 };
 
-inline std::string esc_json(const std::string& s) {
+static inline std::string esc_json(const std::string& s) {
     std::string r;
     r.reserve(s.size() + 4);
     for (char c : s) {
@@ -316,7 +341,7 @@ inline std::string esc_json(const std::string& s) {
     return r;
 }
 
-Config load_config(const fs::path& p) {
+static Config load_config(const fs::path& p) {
     Config c;
     if (!fs::exists(p)) return c;
     std::ifstream f(p);
@@ -329,7 +354,7 @@ Config load_config(const fs::path& p) {
     return c;
 }
 
-void save_config(const Config& c, const fs::path& p) {
+static void save_config(const Config& c, const fs::path& p) {
     char buf[512];
     int n = snprintf(buf, sizeof(buf),
         "{\n  \"username\": \"%s\",\n  \"java_path\": \"%s\",\n  \"ram_gb\": %d\n}\n",
@@ -337,15 +362,13 @@ void save_config(const Config& c, const fs::path& p) {
     if (n > 0) { std::ofstream f(p); f.write(buf, n); }
 }
 
-inline bool check_java(const std::string& java) {
+static inline bool check_java(const std::string& java) {
     return system(("\"" + java + "\" -version > NUL 2>&1").c_str()) == 0;
 }
 
-// ── Version helpers ───────────────────────────────────────────────────────────
-
 struct MCVer { int v[3] = {}; };
 
-MCVer parse_mc_ver(const std::string& s) {
+static MCVer parse_mc_ver(const std::string& s) {
     MCVer r{};
     int idx = 0;
     const char* p = s.c_str();
@@ -357,7 +380,7 @@ MCVer parse_mc_ver(const std::string& s) {
     return r;
 }
 
-inline int cmp_ver(const MCVer& a, const MCVer& b) {
+static inline int cmp_ver(const MCVer& a, const MCVer& b) {
     for (int i = 0; i < 3; ++i) {
         if (a.v[i] < b.v[i]) return -1;
         if (a.v[i] > b.v[i]) return  1;
@@ -365,7 +388,7 @@ inline int cmp_ver(const MCVer& a, const MCVer& b) {
     return 0;
 }
 
-inline int required_jdk(const std::string& mc) {
+static inline int required_jdk(const std::string& mc) {
     static const MCVer v117 = parse_mc_ver("1.17");
     static const MCVer v121 = parse_mc_ver("1.21");
     MCVer v = parse_mc_ver(mc);
@@ -374,11 +397,7 @@ inline int required_jdk(const std::string& mc) {
     return 21;
 }
 
-// Returns the Mojang runtime component name based purely on version ranges:
-//   <= 1.16.x   -> jre-legacy          (Java 8,  Oracle JRE)
-//   1.17-1.20.4 -> java-runtime-gamma  (Java 17)
-//   1.20.5+     -> java-runtime-delta  (Java 21)
-std::string get_runtime_component_for_version(const std::string& mc) {
+static std::string get_runtime_component_for_version(const std::string& mc) {
     static const MCVer v117  = parse_mc_ver("1.17");
     static const MCVer v1205 = parse_mc_ver("1.20.5");
     MCVer v = parse_mc_ver(mc);
@@ -387,9 +406,7 @@ std::string get_runtime_component_for_version(const std::string& mc) {
     return "java-runtime-delta";
 }
 
-// ── Minecraft helpers ─────────────────────────────────────────────────────────
-
-std::string make_offline_uuid(const std::string& name) {
+static std::string make_offline_uuid(const std::string& name) {
     std::string seed = "OfflinePlayer:" + name;
     uint8_t h[16]{};
     for (size_t i = 0; i < seed.size(); ++i) {
@@ -406,7 +423,7 @@ std::string make_offline_uuid(const std::string& name) {
     return buf;
 }
 
-inline bool lib_applies(const JVal& lib) {
+static inline bool lib_applies(const JVal& lib) {
     if (!lib.has("rules")) return true;
     bool allowed = false;
     for (size_t i = 0; i < lib["rules"].size(); ++i) {
@@ -417,7 +434,7 @@ inline bool lib_applies(const JVal& lib) {
     return allowed;
 }
 
-std::string find_java_in_dir(const fs::path& dir) {
+static std::string find_java_in_dir(const fs::path& dir) {
     if (!fs::exists(dir)) return {};
     std::error_code ec;
     for (auto& e : fs::recursive_directory_iterator(dir, ec)) {
@@ -429,31 +446,45 @@ std::string find_java_in_dir(const fs::path& dir) {
     return {};
 }
 
-bool download_file(const std::string& url, const fs::path& dest) {
-    if (fs::exists(dest) && fs::file_size(dest) > 0) return true;
-    if (!http_download(url, dest)) {
-        fprintf(stderr, "  [FAIL] %s\n", dest.filename().string().c_str());
-        return false;
+static std::string maven_path(const std::string& coords) {
+    size_t c1 = coords.find(':');
+    if (c1 == std::string::npos) return {};
+    size_t c2 = coords.find(':', c1 + 1);
+    if (c2 == std::string::npos) return {};
+
+    std::string group    = coords.substr(0, c1);
+    std::string artifact = coords.substr(c1 + 1, c2 - c1 - 1);
+    std::string ver      = coords.substr(c2 + 1);
+
+    size_t cls_pos = ver.find(':');
+    std::string classifier;
+    if (cls_pos != std::string::npos) {
+        classifier = ver.substr(cls_pos + 1);
+        ver = ver.substr(0, cls_pos);
     }
-    return true;
+
+    std::replace(group.begin(), group.end(), '.', '/');
+
+    std::string fname = artifact + "-" + ver;
+    if (!classifier.empty()) fname += "-" + classifier;
+    fname += ".jar";
+
+    return group + "/" + artifact + "/" + ver + "/" + fname;
 }
 
-static const char* MANIFEST_URL  = "https://launchermeta.mojang.com/mc/game/version_manifest.json";
-static const char* RESOURCES_URL = "https://resources.download.minecraft.net/";
-
-// ── Mojang JRE install ────────────────────────────────────────────────────────
-
+static const char* MANIFEST_URL   = "https://launchermeta.mojang.com/mc/game/version_manifest.json";
+static const char* RESOURCES_URL  = "https://resources.download.minecraft.net/";
 static const char* RUNTIME_ALL_URL =
     "https://launchermeta.mojang.com/v1/products/java-runtime/"
     "2ec0cc96c44e5a76b9c8b7c39df7210883d12871/all.json";
+static const char* FABRIC_META_BASE = "https://meta.fabricmc.net/v2/versions/";
 
-bool install_bundled_jre(const fs::path& root, Config& cfg, const fs::path& cfg_path,
-                         const std::string& mc_ver = "") {
+static bool install_bundled_jre(const fs::path& root, Config& cfg, const fs::path& cfg_path,
+                                 const std::string& mc_ver = "") {
     std::string component = mc_ver.empty() ? "jre-legacy"
                                            : get_runtime_component_for_version(mc_ver);
     fs::path jre_dir = root / "runtime" / component;
 
-    // Already installed?
     std::string existing = find_java_in_dir(jre_dir);
     if (!existing.empty()) {
         printf("  Found Mojang JRE (%s): %s\n", component.c_str(), existing.c_str());
@@ -468,7 +499,6 @@ bool install_bundled_jre(const fs::path& root, Config& cfg, const fs::path& cfg_
     std::getline(std::cin, ans);
     if (ans.empty() || (ans[0] != 'y' && ans[0] != 'Y')) return false;
 
-    // Step 1: fetch all.json
     fputs("  Fetching Mojang runtime index...\n", stdout);
     std::string all_str = http_get_str(RUNTIME_ALL_URL);
     if (all_str.empty()) { fputs("  Failed to fetch runtime index.\n", stderr); return false; }
@@ -483,46 +513,35 @@ bool install_bundled_jre(const fs::path& root, Config& cfg, const fs::path& cfg_
     if (!comp_arr.is_array() || !comp_arr.size()) {
         fputs("  Empty component entry.\n", stderr); return false;
     }
-    std::string manifest_url = comp_arr[0]["manifest"]["url"].str();
+    std::string manifest_url = comp_arr[size_t(0)]["manifest"]["url"].str();
     if (manifest_url.empty()) { fputs("  No manifest URL.\n", stderr); return false; }
 
-    // Step 2: fetch file manifest
     printf("  Fetching file manifest for '%s'...\n", component.c_str());
     std::string mf_str = http_get_str(manifest_url);
     if (mf_str.empty()) { fputs("  Failed to fetch file manifest.\n", stderr); return false; }
     auto mf = parse_json(mf_str);
 
-    // Step 3: download every file
     fs::create_directories(jre_dir);
     const auto& files = mf["files"];
-    size_t total = files.size(), done = 0;
-    printf("  Downloading %zu files...\n", total);
 
+    std::vector<DLTask> tasks;
+    tasks.reserve(files.size());
     for (const auto& kv : files.obj) {
         const std::string& rel_path = kv.first;
         const JVal& entry           = kv.second;
-        const std::string& type     = entry["type"].str();
-        ++done;
-
-        if (type == "directory") {
+        if (entry["type"].str() == "directory") {
             fs::create_directories(jre_dir / rel_path);
             continue;
         }
-        if (type != "file") continue;
+        if (entry["type"].str() != "file") continue;
         if (!entry.has("downloads") || !entry["downloads"].has("raw")) continue;
-
         std::string dl_url = entry["downloads"]["raw"]["url"].str();
         if (dl_url.empty()) continue;
-
-        fs::path dest = jre_dir / rel_path;
-        fs::create_directories(dest.parent_path());
-        if (!download_file(dl_url, dest))
-            fprintf(stderr, "  [FAIL] %s\n", rel_path.c_str());
-
-        if (done % 20 == 0 || done == total)
-            printf("  Progress: %zu/%zu\r", done, total);
+        tasks.push_back({std::move(dl_url), jre_dir / rel_path});
     }
-    putchar('\n');
+
+    printf("  Downloading %zu JRE files...\n", tasks.size());
+    parallel_dl(tasks, 16);
 
     std::string found = find_java_in_dir(jre_dir);
     if (found.empty()) {
@@ -536,56 +555,27 @@ bool install_bundled_jre(const fs::path& root, Config& cfg, const fs::path& cfg_
     return true;
 }
 
-// ── Download ──────────────────────────────────────────────────────────────────
-
-JVal fetch_manifest() {
-    fputs("Fetching version manifest...\n", stdout);
-    std::string s = http_get_str(MANIFEST_URL);
-    if (s.empty()) { fputs("Failed to fetch manifest.\n", stderr); return {}; }
-    return parse_json(s);
-}
-
-bool download_minecraft(const fs::path& root, const std::string& version) {
-    auto manifest = fetch_manifest();
-    if (manifest.is_null()) return false;
-
-    std::string ver_url;
-    for (size_t i = 0; i < manifest["versions"].size(); ++i) {
-        const auto& v = manifest["versions"].arr[i];
-        if (v["id"].str() == version) { ver_url = v["url"].str(); break; }
-    }
-    if (ver_url.empty()) { fprintf(stderr, "Version %s not found.\n", version.c_str()); return false; }
-
-    fs::path ver_dir  = root / "versions" / version;
-    fs::path ver_json = ver_dir / (version + ".json");
-    fs::path ver_jar  = ver_dir / (version + ".jar");
-    fs::create_directories(ver_dir);
-
-    printf("[2/5] Fetching %s version JSON...\n", version.c_str());
-    std::string ver_str;
-    if (fs::exists(ver_json)) {
-        std::ifstream f(ver_json);
-        ver_str.assign(std::istreambuf_iterator<char>(f), {});
-    } else {
-        ver_str = http_get_str(ver_url);
-        if (ver_str.empty()) { fputs("Failed to fetch version JSON.\n", stderr); return false; }
-        std::ofstream f(ver_json); f << ver_str;
-    }
-    auto vj = parse_json(ver_str);
-
-    fputs("[3/5] Downloading client JAR...\n", stdout);
-    if (!download_file(vj["downloads"]["client"]["url"].str(), ver_jar)) {
-        fputs("Failed to download client JAR.\n", stderr); return false;
-    }
-
-    fputs("[4/5] Downloading libraries...\n", stdout);
+static void download_libraries_to_tasks(const fs::path& root, const JVal& vj,
+                                         std::vector<DLTask>& tasks) {
+    if (!vj.has("libraries")) return;
     fs::path lib_dir = root / "libraries";
     for (size_t i = 0; i < vj["libraries"].size(); ++i) {
         const auto& lib = vj["libraries"].arr[i];
         if (!lib_applies(lib)) continue;
 
-        bool is_native = false;
+        if (lib.has("name") && !lib.has("downloads")) {
+            std::string path = maven_path(lib["name"].str());
+            if (path.empty()) continue;
+            std::string base_url = lib.has("url") ? lib["url"].str() : "https://libraries.minecraft.net/";
+            if (!base_url.empty() && base_url.back() != '/') base_url += '/';
+            tasks.push_back({base_url + path, lib_dir / path});
+            continue;
+        }
+
+        if (!lib.has("downloads")) continue;
+
         std::string nat_cls;
+        bool is_native = false;
         if (lib.has("natives") && lib["natives"].has("windows")) {
             nat_cls = lib["natives"]["windows"].str();
             const char* arch = sizeof(void*) == 8 ? "64" : "32";
@@ -594,8 +584,7 @@ bool download_minecraft(const fs::path& root, const std::string& version) {
             is_native = true;
         }
 
-        auto try_dl = [&](const std::string& cls) {
-            if (!lib.has("downloads")) return;
+        auto push_art = [&](const std::string& cls) {
             const JVal* art = nullptr;
             if (!cls.empty()) {
                 if (lib["downloads"].has("classifiers") && lib["downloads"]["classifiers"].has(cls))
@@ -606,28 +595,47 @@ bool download_minecraft(const fs::path& root, const std::string& version) {
             if (!art || art->is_null()) return;
             const auto& u = (*art)["url"].str();
             const auto& p = (*art)["path"].str();
-            if (u.empty() || p.empty()) return;
-            fs::path dest = lib_dir / p;
-            if (download_file(u, dest)) {
-                printf("  + %s\n", p.c_str());
-                if (is_native) {
-                    fs::path nat_dir = root / "versions" / version / "natives";
-                    fs::create_directories(nat_dir);
-                    system(("tar -xf \"" + dest.string() + "\" -C \"" + nat_dir.string() + "\" --exclude=META-INF 2>NUL").c_str());
-                }
-            } else {
-                fprintf(stderr, "  warn: failed %s\n", p.c_str());
-            }
+            if (!u.empty() && !p.empty()) tasks.push_back({u, lib_dir / p});
         };
 
-        if (is_native) try_dl(nat_cls);
-        try_dl({});
+        if (is_native) push_art(nat_cls);
+        push_art({});
     }
+}
 
-    fputs("[5/5] Downloading assets...\n", stdout);
+static void extract_natives(const fs::path& root, const std::string& version, const JVal& vj) {
+    if (!vj.has("libraries")) return;
+    fs::path lib_dir = root / "libraries";
+    fs::path nat_dir = root / "versions" / version / "natives";
+    fs::create_directories(nat_dir);
+    for (size_t i = 0; i < vj["libraries"].size(); ++i) {
+        const auto& lib = vj["libraries"].arr[i];
+        if (!lib_applies(lib)) continue;
+        if (!lib.has("natives") || !lib["natives"].has("windows")) continue;
+        std::string nat_cls = lib["natives"]["windows"].str();
+        const char* arch = sizeof(void*) == 8 ? "64" : "32";
+        size_t pos = nat_cls.find("${arch}");
+        if (pos != std::string::npos) nat_cls.replace(pos, 7, arch);
+        if (!lib.has("downloads") || !lib["downloads"].has("classifiers")) continue;
+        if (!lib["downloads"]["classifiers"].has(nat_cls)) continue;
+        const auto& p = lib["downloads"]["classifiers"][nat_cls]["path"].str();
+        if (p.empty()) continue;
+        fs::path jar = lib_dir / p;
+        if (!fs::exists(jar)) continue;
+        system(("tar -xf \"" + jar.string() + "\" -C \"" + nat_dir.string() +
+                "\" --exclude=META-INF 2>NUL").c_str());
+    }
+}
+
+static bool download_assets(const fs::path& root, const JVal& vj) {
     const auto& idx_url = vj["assetIndex"]["url"].str();
     const auto& idx_id  = vj["assetIndex"]["id"].str();
-    fs::path idx_file   = root / "assets" / "indexes" / (idx_id + ".json");
+    if (idx_url.empty() || idx_id.empty()) {
+        fputs("  No asset index in version JSON.\n", stderr);
+        return false;
+    }
+
+    fs::path idx_file = root / "assets" / "indexes" / (idx_id + ".json");
     fs::create_directories(idx_file.parent_path());
 
     std::string idx_str;
@@ -636,50 +644,131 @@ bool download_minecraft(const fs::path& root, const std::string& version) {
         idx_str.assign(std::istreambuf_iterator<char>(f), {});
     } else {
         idx_str = http_get_str(idx_url);
-        if (idx_str.empty()) { fputs("Failed to fetch asset index.\n", stderr); return false; }
+        if (idx_str.empty()) { fputs("  Failed to fetch asset index.\n", stderr); return false; }
         std::ofstream f(idx_file); f << idx_str;
     }
 
     auto idx_json = parse_json(idx_str);
     const auto& objs = idx_json["objects"];
-    size_t total = objs.size(), done = 0;
+
+    std::vector<DLTask> tasks;
+    tasks.reserve(objs.size());
     for (const auto& kv : objs.obj) {
         const auto& hash = kv.second["hash"].str();
-        std::string pfx  = hash.substr(0, 2);
-        fs::path dest    = root / "assets" / "objects" / pfx / hash;
-        if (!fs::exists(dest) || !fs::file_size(dest))
-            download_file(std::string(RESOURCES_URL) + pfx + "/" + hash, dest);
-        ++done;
-        if (done % 50 == 0 || done == total)
-            printf("  Assets: %zu/%zu\r", done, total);
+        if (hash.size() < 2) continue;
+        std::string pfx = hash.substr(0, 2);
+        fs::path dest   = root / "assets" / "objects" / pfx / hash;
+        if (fs::exists(dest) && fs::file_size(dest) > 0) continue;
+        tasks.push_back({std::string(RESOURCES_URL) + pfx + "/" + hash, std::move(dest)});
     }
-    putchar('\n');
+
+    printf("  Fetching %zu assets (%zu already cached)...\n",
+           objs.size(), objs.size() - tasks.size());
+    parallel_dl(tasks, 24);
     return true;
 }
 
-// ── Launch ────────────────────────────────────────────────────────────────────
-
-std::string build_classpath(const fs::path& root, const JVal& vj, const std::string& version) {
-    std::string cp;
-    cp.reserve(4096);
-    fs::path lib_dir = root / "libraries";
-    for (size_t i = 0; i < vj["libraries"].size(); ++i) {
-        const auto& lib = vj["libraries"].arr[i];
-        if (!lib_applies(lib)) continue;
-        if (lib.has("natives") && lib["natives"].has("windows")) continue;
-        if (!lib.has("downloads") || !lib["downloads"].has("artifact")) continue;
-        const auto& p = lib["downloads"]["artifact"]["path"].str();
-        if (p.empty()) continue;
-        fs::path jar = lib_dir / p;
-        if (fs::exists(jar)) { cp += jar.string(); cp += ';'; }
+static bool download_minecraft_base(const fs::path& root, const std::string& version,
+                                     const JVal& manifest, bool print_steps = true) {
+    std::string ver_url;
+    for (size_t i = 0; i < manifest["versions"].size(); ++i) {
+        const auto& v = manifest["versions"].arr[i];
+        if (v["id"].str() == version) { ver_url = v["url"].str(); break; }
     }
-    cp += (root / "versions" / version / (version + ".jar")).string();
-    return cp;
+    if (ver_url.empty()) {
+        fprintf(stderr, "Version %s not found in manifest.\n", version.c_str());
+        return false;
+    }
+
+    fs::path ver_dir  = root / "versions" / version;
+    fs::path ver_json = ver_dir / (version + ".json");
+    fs::path ver_jar  = ver_dir / (version + ".jar");
+    fs::create_directories(ver_dir);
+
+    if (print_steps) printf("[2/5] Fetching %s version JSON...\n", version.c_str());
+    std::string ver_str;
+    if (fs::exists(ver_json)) {
+        std::ifstream f(ver_json); ver_str.assign(std::istreambuf_iterator<char>(f), {});
+    } else {
+        ver_str = http_get_str(ver_url);
+        if (ver_str.empty()) { fputs("Failed to fetch version JSON.\n", stderr); return false; }
+        std::ofstream f(ver_json); f << ver_str;
+    }
+    auto vj = parse_json(ver_str);
+
+    if (print_steps) fputs("[3/5] Downloading client JAR...\n", stdout);
+    if (!download_file(vj["downloads"]["client"]["url"].str(), ver_jar)) {
+        fputs("Failed to download client JAR.\n", stderr); return false;
+    }
+
+    if (print_steps) fputs("[4/5] Downloading libraries...\n", stdout);
+    std::vector<DLTask> lib_tasks;
+    download_libraries_to_tasks(root, vj, lib_tasks);
+    parallel_dl(lib_tasks, 16);
+    extract_natives(root, version, vj);
+
+    if (print_steps) fputs("[5/5] Downloading assets...\n", stdout);
+    download_assets(root, vj);
+
+    return true;
+}
+
+static bool download_fabric(const fs::path& root, const std::string& mc_version,
+                              const JVal& manifest) {
+    printf("Fetching Fabric loaders for Minecraft %s...\n", mc_version.c_str());
+    std::string loaders_str = http_get_str(std::string(FABRIC_META_BASE) + "loader/" + mc_version);
+    if (loaders_str.empty()) {
+        fputs("Failed to fetch Fabric loader list. This MC version may not be supported by Fabric.\n", stderr);
+        return false;
+    }
+    auto loaders_j = parse_json(loaders_str);
+    if (!loaders_j.is_array() || !loaders_j.size()) {
+        fputs("No Fabric loaders available for this Minecraft version.\n", stderr);
+        return false;
+    }
+
+    const std::string& loader_ver = loaders_j[size_t(0)]["loader"]["version"].str();
+    if (loader_ver.empty()) { fputs("Could not determine Fabric loader version.\n", stderr); return false; }
+    printf("Using Fabric Loader: %s\n", loader_ver.c_str());
+
+    std::string fabric_id = "fabric-loader-" + loader_ver + "-" + mc_version;
+    fs::path ver_dir  = root / "versions" / fabric_id;
+    fs::path ver_json = ver_dir / (fabric_id + ".json");
+    fs::create_directories(ver_dir);
+
+    fputs("[1/5] Fetching Fabric profile JSON...\n", stdout);
+    std::string profile_url = std::string(FABRIC_META_BASE) + "loader/" + mc_version +
+                              "/" + loader_ver + "/profile/json";
+    std::string profile_str;
+    if (fs::exists(ver_json)) {
+        std::ifstream f(ver_json); profile_str.assign(std::istreambuf_iterator<char>(f), {});
+    } else {
+        profile_str = http_get_str(profile_url);
+        if (profile_str.empty()) { fputs("Failed to fetch Fabric profile JSON.\n", stderr); return false; }
+        std::ofstream f(ver_json); f << profile_str;
+    }
+    auto fabric_vj = parse_json(profile_str);
+
+    printf("[2/5] Downloading base Minecraft %s...\n", mc_version.c_str());
+    if (!download_minecraft_base(root, mc_version, manifest, false)) {
+        fputs("Failed to download base Minecraft for Fabric.\n", stderr);
+        return false;
+    }
+
+    fputs("[3/5] Downloading Fabric libraries...\n", stdout);
+    std::vector<DLTask> fabric_lib_tasks;
+    download_libraries_to_tasks(root, fabric_vj, fabric_lib_tasks);
+    parallel_dl(fabric_lib_tasks, 16);
+
+    fputs("[4/5] (assets already fetched with base MC)\n", stdout);
+
+    printf("\nFabric install complete: %s\n", fabric_id.c_str());
+    return true;
 }
 
 using VarMap = std::unordered_map<std::string, std::string>;
 
-std::string tok_replace(const std::string& s, const VarMap& m) {
+static std::string tok_replace(const std::string& s, const VarMap& m) {
     std::string r;
     r.reserve(s.size() + 32);
     for (size_t i = 0; i < s.size(); ) {
@@ -696,7 +785,7 @@ std::string tok_replace(const std::string& s, const VarMap& m) {
     return r;
 }
 
-std::string win_quote(const std::string& s) {
+static std::string win_quote(const std::string& s) {
     if (s.find_first_of(" \t\"") == std::string::npos && !s.empty()) return s;
     std::string r;
     r.reserve(s.size() + 8);
@@ -712,21 +801,75 @@ std::string win_quote(const std::string& s) {
     return r;
 }
 
-bool launch_version(const fs::path& root, const Config& cfg, const std::string& version) {
+static std::string build_classpath(const fs::path& root, const JVal& vj, const JVal& parent_vj,
+                                    const std::string& version, const std::string& jar_ver) {
+    std::string cp;
+    cp.reserve(8192);
+    fs::path lib_dir = root / "libraries";
+
+    auto add_libs = [&](const JVal& j) {
+        if (!j.has("libraries")) return;
+        for (size_t i = 0; i < j["libraries"].size(); ++i) {
+            const auto& lib = j["libraries"].arr[i];
+            if (!lib_applies(lib)) continue;
+            if (lib.has("natives") && lib["natives"].has("windows")) continue;
+
+            std::string path;
+            if (lib.has("downloads") && lib["downloads"].has("artifact")) {
+                path = lib["downloads"]["artifact"]["path"].str();
+            } else if (lib.has("name")) {
+                path = maven_path(lib["name"].str());
+            }
+            if (path.empty()) continue;
+            fs::path jar = lib_dir / path;
+            if (fs::exists(jar)) { cp += jar.string(); cp += ';'; }
+        }
+    };
+
+    if (!parent_vj.is_null()) {
+        add_libs(parent_vj);
+        add_libs(vj);
+    } else {
+        add_libs(vj);
+    }
+
+    cp += (root / "versions" / jar_ver / (jar_ver + ".jar")).string();
+    return cp;
+}
+
+static bool launch_version(const fs::path& root, const Config& cfg, const std::string& version) {
     fs::path vj_path = root / "versions" / version / (version + ".json");
     if (!fs::exists(vj_path)) { fprintf(stderr, "Not installed: %s\n", version.c_str()); return false; }
 
     std::ifstream f(vj_path);
     auto vj = parse_json(std::string(std::istreambuf_iterator<char>(f), {}));
 
-    std::string cp        = build_classpath(root, vj, version);
+    JVal parent_vj;
+    std::string base_ver = version;
+    if (vj.has("inheritsFrom")) {
+        base_ver = vj["inheritsFrom"].str();
+        fs::path pj_path = root / "versions" / base_ver / (base_ver + ".json");
+        if (!fs::exists(pj_path)) {
+            fprintf(stderr, "Base version '%s' not installed. Please reinstall.\n", base_ver.c_str());
+            return false;
+        }
+        std::ifstream pf(pj_path);
+        parent_vj = parse_json(std::string(std::istreambuf_iterator<char>(pf), {}));
+    }
+
+    const bool has_parent = !parent_vj.is_null();
+    const JVal& base_vj   = has_parent ? parent_vj : vj;
+
+    std::string cp        = build_classpath(root, vj, parent_vj, version, base_ver);
     std::string uuid      = make_offline_uuid(cfg.username);
-    std::string nat       = (root / "versions" / version / "natives").string();
+    std::string nat       = (root / "versions" / base_ver / "natives").string();
     std::string assets    = (root / "assets").string();
-    std::string asset_idx = vj["assetIndex"]["id"].str();
+    std::string asset_idx = base_vj["assetIndex"]["id"].str();
     std::string game_dir  = root.string();
-    std::string ver_type  = vj.has("type") ? vj["type"].str() : "release";
+    std::string ver_type  = vj.has("type") ? vj["type"].str() :
+                            (base_vj.has("type") ? base_vj["type"].str() : "release");
     std::string main_cls  = vj["mainClass"].str();
+    if (main_cls.empty()) main_cls = base_vj["mainClass"].str();
     if (main_cls.empty()) main_cls = "net.minecraft.client.main.Main";
 
     VarMap vars = {
@@ -744,15 +887,15 @@ bool launch_version(const fs::path& root, const Config& cfg, const std::string& 
         {"natives_directory", nat},
         {"classpath",         cp},
         {"launcher_name",     "MCLauncher"},
-        {"launcher_version",  "2.0"},
+        {"launcher_version",  "3.0"},
     };
 
     std::vector<std::string> args;
-    args.reserve(32);
+    args.reserve(48);
     args.push_back("-Xmx" + std::to_string(cfg.ram_gb) + "G");
     args.push_back("-Xms512m");
 
-    if (required_jdk(version) <= 8) {
+    if (required_jdk(base_ver) <= 8) {
         args.push_back("-XX:+UseConcMarkSweepGC");
         args.push_back("-XX:+CMSIncrementalMode");
         args.push_back("-XX:HeapDumpPath=MojangTricksIntelDriversForPerformance_javaw.exe_minecraft.exe.heapdump");
@@ -764,33 +907,38 @@ bool launch_version(const fs::path& root, const Config& cfg, const std::string& 
         });
     }
 
-    if (vj.has("arguments")) {
-        auto collect = [&](const JVal& arr, std::vector<std::string>& out) {
-            for (size_t i = 0; i < arr.size(); ++i) {
-                const auto& e = arr.arr[i];
-                if (e.is_string()) { out.push_back(tok_replace(e.str(), vars)); continue; }
-                if (!e.is_object()) continue;
-                bool ok = true;
-                if (e.has("rules")) {
-                    ok = false;
-                    for (size_t r = 0; r < e["rules"].size(); ++r) {
-                        const auto& rule = e["rules"].arr[r];
-                        bool match = !rule.has("os") || rule["os"]["name"].str() == "windows";
-                        if (rule.has("features")) match = false;
-                        if (match) ok = (rule["action"].str() == "allow");
-                    }
+    auto collect_args = [&](const JVal& src, const std::string& which,
+                             std::vector<std::string>& out) {
+        if (!src.has("arguments") || !src["arguments"].has(which)) return;
+        const auto& arr = src["arguments"][which];
+        for (size_t i = 0; i < arr.size(); ++i) {
+            const auto& e = arr.arr[i];
+            if (e.is_string()) { out.push_back(tok_replace(e.str(), vars)); continue; }
+            if (!e.is_object()) continue;
+            bool ok = true;
+            if (e.has("rules")) {
+                ok = false;
+                for (size_t r = 0; r < e["rules"].size(); ++r) {
+                    const auto& rule = e["rules"].arr[r];
+                    bool match = !rule.has("os") || rule["os"]["name"].str() == "windows";
+                    if (rule.has("features")) match = false;
+                    if (match) ok = (rule["action"].str() == "allow");
                 }
-                if (!ok) continue;
-                const auto& val = e["value"];
-                if (val.is_string()) out.push_back(tok_replace(val.str(), vars));
-                else if (val.is_array())
-                    for (size_t j = 0; j < val.size(); ++j)
-                        out.push_back(tok_replace(val.arr[j].str(), vars));
             }
-        };
+            if (!ok) continue;
+            const auto& val = e["value"];
+            if (val.is_string()) out.push_back(tok_replace(val.str(), vars));
+            else if (val.is_array())
+                for (size_t j = 0; j < val.size(); ++j)
+                    out.push_back(tok_replace(val.arr[j].str(), vars));
+        }
+    };
+
+    if (base_vj.has("arguments")) {
         std::vector<std::string> jvm_a, game_a;
-        collect(vj["arguments"]["jvm"],  jvm_a);
-        collect(vj["arguments"]["game"], game_a);
+        collect_args(base_vj, "jvm",  jvm_a);
+        if (has_parent) collect_args(vj, "jvm", jvm_a);
+        collect_args(base_vj, "game", game_a);
         for (auto& a : jvm_a)  args.push_back(a);
         args.push_back(main_cls);
         for (auto& a : game_a) args.push_back(a);
@@ -801,7 +949,7 @@ bool launch_version(const fs::path& root, const Config& cfg, const std::string& 
         args.push_back("-cp");
         args.push_back(cp);
         args.push_back(main_cls);
-        const auto& mc_args = vj["minecraftArguments"].str();
+        const auto& mc_args = base_vj["minecraftArguments"].str();
         for (size_t s = 0, e; s < mc_args.size(); s = e+1) {
             e = mc_args.find(' ', s);
             if (e == std::string::npos) { args.push_back(tok_replace(mc_args.substr(s), vars)); break; }
@@ -816,9 +964,11 @@ bool launch_version(const fs::path& root, const Config& cfg, const std::string& 
             java_exec.replace(pos, 8, "javaw.exe");
         else if (java_exec.size() >= 4 &&
                  java_exec.compare(java_exec.size()-4, 4, "java") == 0 &&
-                 (java_exec.size() == 4 || java_exec[java_exec.size()-5] == '\\' || java_exec[java_exec.size()-5] == '/'))
+                 (java_exec.size() == 4 || java_exec[java_exec.size()-5] == '\\' ||
+                  java_exec[java_exec.size()-5] == '/'))
             java_exec += "w";
     }
+
     std::string cmd;
     cmd.reserve(2048);
     cmd = win_quote(java_exec);
@@ -843,7 +993,7 @@ bool launch_version(const fs::path& root, const Config& cfg, const std::string& 
     return true;
 }
 
-std::vector<std::string> get_installed_versions(const fs::path& root) {
+static std::vector<std::string> get_installed_versions(const fs::path& root) {
     std::vector<std::string> v;
     fs::path ver_dir = root / "versions";
     if (!fs::exists(ver_dir)) return v;
@@ -851,29 +1001,76 @@ std::vector<std::string> get_installed_versions(const fs::path& root) {
     for (auto& e : fs::directory_iterator(ver_dir, ec)) {
         if (!e.is_directory(ec)) continue;
         std::string name = e.path().filename().string();
+        fs::path json_p  = e.path() / (name + ".json");
+        if (!fs::exists(json_p)) continue;
+
         fs::path jar = e.path() / (name + ".jar");
-        if (fs::exists(jar) && fs::file_size(jar) > 1024) v.push_back(name);
+        if (fs::exists(jar) && fs::file_size(jar) > 1024) { v.push_back(name); continue; }
+
+        std::ifstream jf(json_p);
+        std::string js((std::istreambuf_iterator<char>(jf)), {});
+        auto jv = parse_json(js);
+        if (jv.has("inheritsFrom")) {
+            std::string base = jv["inheritsFrom"].str();
+            fs::path base_jar = ver_dir / base / (base + ".jar");
+            if (fs::exists(base_jar) && fs::file_size(base_jar) > 1024)
+                v.push_back(name);
+        }
     }
     std::sort(v.begin(), v.end());
     return v;
 }
 
-void print_header(const char* title) {
+static void print_header(const char* title) {
     printf("\n================================================\n  %s\n================================================\n", title);
 }
 
-void section_download(const fs::path& root, Config& cfg, const fs::path& cfg_path) {
+static void section_download(const fs::path& root, Config& cfg, const fs::path& cfg_path) {
     print_header("DOWNLOAD");
 
-    auto manifest = fetch_manifest();
-    if (manifest.is_null()) { fputs("Press Enter to continue...", stdout); std::cin.get(); return; }
+    fputs("\nLoader type:\n  [1] Vanilla\n  [2] Fabric\nChoice: ", stdout);
+    std::string loader_choice;
+    std::getline(std::cin, loader_choice);
+    bool use_fabric = (loader_choice == "2");
 
     struct VE { std::string id, type; };
     std::vector<VE> entries;
-    entries.reserve(manifest["versions"].size());
-    for (size_t i = 0; i < manifest["versions"].size(); ++i) {
-        const auto& v = manifest["versions"].arr[i];
-        entries.push_back({v["id"].str(), v["type"].str()});
+    JVal manifest;
+
+    if (use_fabric) {
+        fputs("Fetching Fabric supported versions...\n", stdout);
+        std::string fv_str = http_get_str(std::string(FABRIC_META_BASE) + "game");
+        if (fv_str.empty()) {
+            fputs("Failed to fetch Fabric game versions.\nPress Enter to continue...", stdout);
+            std::cin.get(); return;
+        }
+        auto fv = parse_json(fv_str);
+        if (!fv.is_array()) {
+            fputs("Unexpected Fabric version response.\nPress Enter to continue...", stdout);
+            std::cin.get(); return;
+        }
+        entries.reserve(fv.size());
+        for (size_t i = 0; i < fv.size(); ++i) {
+            const auto& v = fv.arr[i];
+            entries.push_back({v["version"].str(), v["stable"].bval ? "release" : "snapshot"});
+        }
+
+        fputs("Fetching Mojang manifest (needed for base download)...\n", stdout);
+        std::string ms = http_get_str(MANIFEST_URL);
+        if (!ms.empty()) manifest = parse_json(ms);
+    } else {
+        fputs("Fetching version manifest...\n", stdout);
+        std::string ms = http_get_str(MANIFEST_URL);
+        if (ms.empty()) {
+            fputs("Failed to fetch manifest.\nPress Enter to continue...", stdout);
+            std::cin.get(); return;
+        }
+        manifest = parse_json(ms);
+        entries.reserve(manifest["versions"].size());
+        for (size_t i = 0; i < manifest["versions"].size(); ++i) {
+            const auto& v = manifest["versions"].arr[i];
+            entries.push_back({v["id"].str(), v["type"].str()});
+        }
     }
 
     fputs("\nFilter: (1) Releases only  (2) All versions\nChoice: ", stdout);
@@ -912,21 +1109,35 @@ void section_download(const fs::path& root, Config& cfg, const fs::path& cfg_pat
             if (idx < 0 || idx >= (int)filtered.size()) { fputs("Invalid selection.\n", stdout); continue; }
             const std::string& chosen = filtered[idx].id;
 
-            fs::path jar = root / "versions" / chosen / (chosen + ".jar");
-            if (fs::exists(jar) && fs::file_size(jar) > 1024) {
-                printf("\nVersion %s is already installed.\n", chosen.c_str());
-            } else {
-                printf("\nDownload Minecraft %s? (y/n): ", chosen.c_str());
-                std::string ans;
-                std::getline(std::cin, ans);
+            if (use_fabric) {
+                printf("\nDownload Fabric for Minecraft %s? (y/n): ", chosen.c_str());
+                std::string ans; std::getline(std::cin, ans);
                 if (ans.empty() || (ans[0] != 'y' && ans[0] != 'Y')) return;
                 if (!install_bundled_jre(root, cfg, cfg_path, chosen))
                     fputs("Continuing without bundled JRE.\n", stdout);
-                fputs("\n[1/5] Manifest already fetched.\n", stdout);
-                if (!download_minecraft(root, chosen))
-                    fputs("\nDownload failed.\n", stderr);
-                else
-                    printf("\nDownload complete! %s is ready.\n", chosen.c_str());
+                if (manifest.is_null()) {
+                    fputs("Mojang manifest unavailable; cannot download base MC.\n", stderr);
+                } else if (!download_fabric(root, chosen, manifest)) {
+                    fputs("\nFabric download failed.\n", stderr);
+                } else {
+                    printf("\nFabric for Minecraft %s is ready.\n", chosen.c_str());
+                }
+            } else {
+                fs::path jar = root / "versions" / chosen / (chosen + ".jar");
+                if (fs::exists(jar) && fs::file_size(jar) > 1024) {
+                    printf("\nVersion %s is already installed.\n", chosen.c_str());
+                } else {
+                    printf("\nDownload Minecraft %s? (y/n): ", chosen.c_str());
+                    std::string ans; std::getline(std::cin, ans);
+                    if (ans.empty() || (ans[0] != 'y' && ans[0] != 'Y')) return;
+                    if (!install_bundled_jre(root, cfg, cfg_path, chosen))
+                        fputs("Continuing without bundled JRE.\n", stdout);
+                    fputs("\n[1/5] Manifest already fetched.\n", stdout);
+                    if (!download_minecraft_base(root, chosen, manifest))
+                        fputs("\nDownload failed.\n", stderr);
+                    else
+                        printf("\nDownload complete! %s is ready.\n", chosen.c_str());
+                }
             }
             fputs("Press Enter to continue...", stdout); std::cin.get();
             return;
@@ -934,7 +1145,7 @@ void section_download(const fs::path& root, Config& cfg, const fs::path& cfg_pat
     }
 }
 
-void section_settings(Config& cfg, const fs::path& cfg_path) {
+static void section_settings(Config& cfg, const fs::path& cfg_path) {
     for (;;) {
         print_header("SETTINGS");
         printf("  [1] Username   : %s\n"
@@ -973,7 +1184,7 @@ void section_settings(Config& cfg, const fs::path& cfg_path) {
     }
 }
 
-void section_launch(const fs::path& root, Config& cfg, const fs::path& cfg_path) {
+static void section_launch(const fs::path& root, Config& cfg, const fs::path& cfg_path) {
     print_header("LAUNCH");
     auto versions = get_installed_versions(root);
     if (versions.empty()) {
@@ -999,9 +1210,18 @@ void section_launch(const fs::path& root, Config& cfg, const fs::path& cfg_path)
             return;
         }
         const std::string& chosen = versions[idx];
+        std::string base_ver = chosen;
+        {
+            fs::path vj_path = root / "versions" / chosen / (chosen + ".json");
+            if (fs::exists(vj_path)) {
+                std::ifstream vf(vj_path);
+                auto vj = parse_json(std::string(std::istreambuf_iterator<char>(vf), {}));
+                if (vj.has("inheritsFrom")) base_ver = vj["inheritsFrom"].str();
+            }
+        }
         if (!check_java(cfg.java_path)) {
             printf("\nJava not found at: %s\nLocating bundled JRE...\n", cfg.java_path.c_str());
-            if (!install_bundled_jre(root, cfg, cfg_path, chosen)) {
+            if (!install_bundled_jre(root, cfg, cfg_path, base_ver)) {
                 fputs("Java unavailable. Set Java Path in Settings.\nPress Enter to continue...", stderr);
                 std::cin.get();
                 return;
@@ -1019,8 +1239,6 @@ void section_launch(const fs::path& root, Config& cfg, const fs::path& cfg_path)
         std::cin.get();
     }
 }
-
-} // namespace
 
 int main() {
     SetConsoleOutputCP(CP_UTF8);
