@@ -30,9 +30,6 @@ static void apply_theme() {
         (WORD)(g_theme_color & 0x0F));
 }
 
-static void reset_color() {
-    SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), 7);
-}
 
 struct JVal {
     enum Type : uint8_t { Null, Bool, Num, Str, Arr, Obj } type = Null;
@@ -489,12 +486,132 @@ static std::string maven_path(const std::string& coords) {
     return group + "/" + artifact + "/" + ver + "/" + fname;
 }
 
+static bool is_native_artifact_path(const std::string& path) {
+    return path.find("natives-windows") != std::string::npos;
+}
+
+static bool native_path_matches_arch(const std::string& path) {
+    const bool is64 = (sizeof(void*) == 8);
+
+    // Reject wrong-arch suffixes regardless of pointer size
+    if (path.find("natives-windows-arm64") != std::string::npos) return false;
+    if (path.find("natives-windows-x86_64") != std::string::npos) return is64;
+    if (path.find("natives-windows-x86")    != std::string::npos) return !is64;
+
+    // Plain "natives-windows" — generic, accept always
+    return true;
+}
+
 static const char* MANIFEST_URL   = "https://launchermeta.mojang.com/mc/game/version_manifest.json";
 static const char* RESOURCES_URL  = "https://resources.download.minecraft.net/";
 static const char* RUNTIME_ALL_URL =
     "https://launchermeta.mojang.com/v1/products/java-runtime/"
     "2ec0cc96c44e5a76b9c8b7c39df7210883d12871/all.json";
 static const char* FABRIC_META_BASE = "https://meta.fabricmc.net/v2/versions/";
+
+static void download_libraries_to_tasks(const fs::path& root, const JVal& vj,
+                                         std::vector<DLTask>& tasks) {
+    if (!vj.has("libraries")) return;
+    fs::path lib_dir = root / "libraries";
+    for (size_t i = 0; i < vj["libraries"].size(); ++i) {
+        const auto& lib = vj["libraries"].arr[i];
+        if (!lib_applies(lib)) continue;
+
+        // Libraries with no "downloads" block (e.g. Fabric intermediary)
+        if (lib.has("name") && !lib.has("downloads")) {
+            std::string path = maven_path(lib["name"].str());
+            if (path.empty()) continue;
+            std::string base_url = lib.has("url") ? lib["url"].str() : "https://libraries.minecraft.net/";
+            if (!base_url.empty() && base_url.back() != '/') base_url += '/';
+            tasks.push_back({base_url + path, lib_dir / path});
+            continue;
+        }
+
+        if (!lib.has("downloads")) continue;
+
+        // ── Old-format natives (classifiers block) ───────────────────────────
+        if (lib.has("natives") && lib["natives"].has("windows")) {
+            std::string nat_cls = lib["natives"]["windows"].str();
+            const char* arch = sizeof(void*) == 8 ? "64" : "32";
+            size_t pos = nat_cls.find("${arch}");
+            if (pos != std::string::npos) nat_cls.replace(pos, 7, arch);
+
+            if (lib["downloads"].has("classifiers") &&
+                lib["downloads"]["classifiers"].has(nat_cls)) {
+                const auto& a = lib["downloads"]["classifiers"][nat_cls];
+                const auto& u = a["url"].str();
+                const auto& p = a["path"].str();
+                if (!u.empty() && !p.empty())
+                    tasks.push_back({u, lib_dir / p});
+            }
+        }
+
+        // ── Regular artifact (includes modern natives-windows JARs) ──────────
+        if (lib["downloads"].has("artifact")) {
+            const auto& a = lib["downloads"]["artifact"];
+            const auto& u = a["url"].str();
+            const auto& p = a["path"].str();
+            if (!u.empty() && !p.empty())
+                tasks.push_back({u, lib_dir / p});
+        }
+    }
+}
+
+static void extract_natives(const fs::path& root, const std::string& version, const JVal& vj) {
+    if (!vj.has("libraries")) return;
+    fs::path lib_dir = root / "libraries";
+    fs::path nat_dir = root / "versions" / version / "natives";
+    fs::create_directories(nat_dir);
+
+    int extracted = 0;
+    for (size_t i = 0; i < vj["libraries"].size(); ++i) {
+        const auto& lib = vj["libraries"].arr[i];
+        if (!lib_applies(lib)) continue;
+
+        fs::path jar_path;
+
+        // ── Old format ───────────────────────────────────────────────────────
+        if (lib.has("natives") && lib["natives"].has("windows")) {
+            std::string nat_cls = lib["natives"]["windows"].str();
+            const char* arch = sizeof(void*) == 8 ? "64" : "32";
+            size_t pos = nat_cls.find("${arch}");
+            if (pos != std::string::npos) nat_cls.replace(pos, 7, arch);
+
+            if (!lib.has("downloads") ||
+                !lib["downloads"].has("classifiers") ||
+                !lib["downloads"]["classifiers"].has(nat_cls)) continue;
+
+            const auto& p = lib["downloads"]["classifiers"][nat_cls]["path"].str();
+            if (p.empty()) continue;
+            jar_path = lib_dir / p;
+        }
+        // ── Modern format ────────────────────────────────────────────────────
+        else if (lib.has("downloads") && lib["downloads"].has("artifact")) {
+            const auto& p = lib["downloads"]["artifact"]["path"].str();
+            if (!is_native_artifact_path(p)) continue;
+            if (!native_path_matches_arch(p))  continue; // skip wrong arch
+            jar_path = lib_dir / p;
+        }
+        else {
+            continue;
+        }
+
+        if (!fs::exists(jar_path)) {
+            fprintf(stderr, "  [natives] JAR missing: %s\n", jar_path.string().c_str());
+            continue;
+        }
+
+        // JAR == ZIP; tar on Windows 10 1803+ can extract ZIPs natively.
+        std::string cmd =
+            "tar -xf \"" + jar_path.string() +
+            "\" -C \""   + nat_dir.string()  +
+            "\" --exclude=META-INF 2>NUL";
+        system(cmd.c_str());
+        ++extracted;
+    }
+
+    printf("  Extracted %d native JAR(s) -> %s\n", extracted, nat_dir.string().c_str());
+}
 
 static bool install_bundled_jre(const fs::path& root, Config& cfg, const fs::path& cfg_path,
                                  const std::string& mc_ver = "") {
@@ -505,8 +622,12 @@ static bool install_bundled_jre(const fs::path& root, Config& cfg, const fs::pat
     std::string existing = find_java_in_dir(jre_dir);
     if (!existing.empty()) {
         printf("  Found Mojang JRE (%s): %s\n", component.c_str(), existing.c_str());
-        cfg.java_path = existing;
-        save_config(cfg, cfg_path);
+        // Only update java_path if the current one is broken, so we never
+        // overwrite a working custom JDK (e.g. Microsoft JDK 21.0.10).
+        if (!check_java(cfg.java_path)) {
+            cfg.java_path = existing;
+            save_config(cfg, cfg_path);
+        }
         return true;
     }
 
@@ -570,78 +691,6 @@ static bool install_bundled_jre(const fs::path& root, Config& cfg, const fs::pat
     cfg.java_path = found;
     save_config(cfg, cfg_path);
     return true;
-}
-
-static void download_libraries_to_tasks(const fs::path& root, const JVal& vj,
-                                         std::vector<DLTask>& tasks) {
-    if (!vj.has("libraries")) return;
-    fs::path lib_dir = root / "libraries";
-    for (size_t i = 0; i < vj["libraries"].size(); ++i) {
-        const auto& lib = vj["libraries"].arr[i];
-        if (!lib_applies(lib)) continue;
-
-        if (lib.has("name") && !lib.has("downloads")) {
-            std::string path = maven_path(lib["name"].str());
-            if (path.empty()) continue;
-            std::string base_url = lib.has("url") ? lib["url"].str() : "https://libraries.minecraft.net/";
-            if (!base_url.empty() && base_url.back() != '/') base_url += '/';
-            tasks.push_back({base_url + path, lib_dir / path});
-            continue;
-        }
-
-        if (!lib.has("downloads")) continue;
-
-        std::string nat_cls;
-        bool is_native = false;
-        if (lib.has("natives") && lib["natives"].has("windows")) {
-            nat_cls = lib["natives"]["windows"].str();
-            const char* arch = sizeof(void*) == 8 ? "64" : "32";
-            size_t pos = nat_cls.find("${arch}");
-            if (pos != std::string::npos) nat_cls.replace(pos, 7, arch);
-            is_native = true;
-        }
-
-        auto push_art = [&](const std::string& cls) {
-            const JVal* art = nullptr;
-            if (!cls.empty()) {
-                if (lib["downloads"].has("classifiers") && lib["downloads"]["classifiers"].has(cls))
-                    art = &lib["downloads"]["classifiers"][cls];
-            } else if (lib["downloads"].has("artifact")) {
-                art = &lib["downloads"]["artifact"];
-            }
-            if (!art || art->is_null()) return;
-            const auto& u = (*art)["url"].str();
-            const auto& p = (*art)["path"].str();
-            if (!u.empty() && !p.empty()) tasks.push_back({u, lib_dir / p});
-        };
-
-        if (is_native) push_art(nat_cls);
-        push_art({});
-    }
-}
-
-static void extract_natives(const fs::path& root, const std::string& version, const JVal& vj) {
-    if (!vj.has("libraries")) return;
-    fs::path lib_dir = root / "libraries";
-    fs::path nat_dir = root / "versions" / version / "natives";
-    fs::create_directories(nat_dir);
-    for (size_t i = 0; i < vj["libraries"].size(); ++i) {
-        const auto& lib = vj["libraries"].arr[i];
-        if (!lib_applies(lib)) continue;
-        if (!lib.has("natives") || !lib["natives"].has("windows")) continue;
-        std::string nat_cls = lib["natives"]["windows"].str();
-        const char* arch = sizeof(void*) == 8 ? "64" : "32";
-        size_t pos = nat_cls.find("${arch}");
-        if (pos != std::string::npos) nat_cls.replace(pos, 7, arch);
-        if (!lib.has("downloads") || !lib["downloads"].has("classifiers")) continue;
-        if (!lib["downloads"]["classifiers"].has(nat_cls)) continue;
-        const auto& p = lib["downloads"]["classifiers"][nat_cls]["path"].str();
-        if (p.empty()) continue;
-        fs::path jar = lib_dir / p;
-        if (!fs::exists(jar)) continue;
-        system(("tar -xf \"" + jar.string() + "\" -C \"" + nat_dir.string() +
-                "\" --exclude=META-INF 2>NUL").c_str());
-    }
 }
 
 static bool download_assets(const fs::path& root, const JVal& vj) {
@@ -722,6 +771,8 @@ static bool download_minecraft_base(const fs::path& root, const std::string& ver
     std::vector<DLTask> lib_tasks;
     download_libraries_to_tasks(root, vj, lib_tasks);
     parallel_dl(lib_tasks, 16);
+
+    if (print_steps) fputs("[4/5] Extracting natives...\n", stdout);
     extract_natives(root, version, vj);
 
     if (print_steps) fputs("[5/5] Downloading assets...\n", stdout);
@@ -777,6 +828,11 @@ static bool download_fabric(const fs::path& root, const std::string& mc_version,
     download_libraries_to_tasks(root, fabric_vj, fabric_lib_tasks);
     parallel_dl(fabric_lib_tasks, 16);
 
+    // Fabric profiles rarely contain native JARs themselves, but extract any
+    // that exist.  Base MC natives were already extracted by download_minecraft_base.
+    fputs("[3/5] Extracting Fabric natives (if any)...\n", stdout);
+    extract_natives(root, mc_version, fabric_vj);
+
     fputs("[4/5] (assets already fetched with base MC)\n", stdout);
 
     printf("\nFabric install complete: %s\n", fabric_id.c_str());
@@ -818,6 +874,21 @@ static std::string win_quote(const std::string& s) {
     return r;
 }
 
+// Returns true if this library entry is a native-only JAR that should be
+// extracted but NOT placed on the classpath.
+static bool lib_is_native_only(const JVal& lib) {
+    // Old format: explicit "natives" key → extract only, never on classpath
+    if (lib.has("natives") && lib["natives"].has("windows")) return true;
+
+    // Modern format: artifact path contains "natives-windows"
+    if (lib.has("downloads") && lib["downloads"].has("artifact")) {
+        const std::string& p = lib["downloads"]["artifact"]["path"].str();
+        if (is_native_artifact_path(p)) return true;
+    }
+
+    return false;
+}
+
 static std::string build_classpath(const fs::path& root, const JVal& vj, const JVal& parent_vj,
                                     const std::string& version, const std::string& jar_ver) {
     std::string cp;
@@ -829,7 +900,9 @@ static std::string build_classpath(const fs::path& root, const JVal& vj, const J
         for (size_t i = 0; i < j["libraries"].size(); ++i) {
             const auto& lib = j["libraries"].arr[i];
             if (!lib_applies(lib)) continue;
-            if (lib.has("natives") && lib["natives"].has("windows")) continue;
+
+            // Native-only JARs (old OR modern format) must not appear on -cp
+            if (lib_is_native_only(lib)) continue;
 
             std::string path;
             if (lib.has("downloads") && lib["downloads"].has("artifact")) {
